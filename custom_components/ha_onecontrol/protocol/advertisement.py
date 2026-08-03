@@ -199,13 +199,21 @@ def parse_gateway_advertisement(
     }
     is_x180t = _normalise_uuid(X180T_DISCOVERY_SERVICE_UUID) in advertised_services
 
+    # Debug logging for troubleshooting
+    import logging
+    _LOGGER = logging.getLogger(__name__)
+    _LOGGER.debug(
+        "Gateway advertisement: manufacturer_data=%s, service_uuids=%s, is_x180t=%s, capabilities=%s",
+        manufacturer_data, service_uuids, is_x180t, capabilities
+    )
+
     if not is_x180t:
         return capabilities
 
     if not capabilities.uses_modern_tlv:
         return GatewayCapabilities(
-            pairing_method=PairingMethod.UNKNOWN,
-            supports_push_to_pair=capabilities.supports_push_to_pair,
+            pairing_method=PairingMethod.PUSH_BUTTON,
+            supports_push_to_pair=True,
             pairing_enabled=False,
             is_x180t=True,
         )

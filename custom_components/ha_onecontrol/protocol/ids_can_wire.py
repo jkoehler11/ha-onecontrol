@@ -347,6 +347,102 @@ def compose_ids_can_extended_wire_frame(
     return bytes([dlc]) + id_word.to_bytes(4, "big") + payload
 
 
+# ------------------------------------------------------------------
+# IDS-CAN PID Read/Write helpers
+# ------------------------------------------------------------------
+# These compose REQUEST (0x80) frames for PID_READ_LIST (0x10),
+# PID_READ_WRITE (0x11), and GET_PID_PROPERTIES (0x12) operations.
+#
+# Reference: Android OneControl app MyRvLinkCommandGetDevicePid /
+# MyRvLinkCommandSetDevicePid, and IDS-CAN REQUEST frame definitions
+# from IDS.Core.IDS_CAN.
+
+
+def compose_ids_can_pid_read_request(
+    source_address: int,
+    target_address: int,
+    pid_id: int,
+) -> bytes:
+    """Compose a PID_READ_WRITE (0x11) request frame to read a single PID.
+
+    Returns raw wire frame bytes ready for CAN_WRITE characteristic.
+    PID_READ_WRITE request: payload = [pid_hi][pid_lo][0x00=read]
+    """
+    return compose_ids_can_extended_wire_frame(
+        message_type=0x80,  # REQUEST
+        source_address=source_address,
+        target_address=target_address,
+        message_data=0x11,  # PID_READ_WRITE
+        payload=bytes([
+            (pid_id >> 8) & 0xFF,
+            pid_id & 0xFF,
+            0x00,  # read operation
+        ]),
+    )
+
+
+def compose_ids_can_pid_write_request(
+    source_address: int,
+    target_address: int,
+    pid_id: int,
+    value_bytes: bytes,
+) -> bytes:
+    """Compose a PID_READ_WRITE (0x11) request frame to write a PID value.
+
+    PID_READ_WRITE request: payload = [pid_hi][pid_lo][0x01=write][value...]
+    Value length is determined by the PID definition (typically 1-4 bytes).
+    """
+    payload = bytes([
+        (pid_id >> 8) & 0xFF,
+        pid_id & 0xFF,
+        0x01,  # write operation
+    ]) + value_bytes
+    return compose_ids_can_extended_wire_frame(
+        message_type=0x80,  # REQUEST
+        source_address=source_address,
+        target_address=target_address,
+        message_data=0x11,  # PID_READ_WRITE
+        payload=payload,
+    )
+
+
+def compose_ids_can_pid_read_list_request(
+    source_address: int,
+    target_address: int,
+    pid_ids: list[int],
+) -> bytes:
+    """Compose a PID_READ_LIST (0x10) request to read multiple PIDs at once.
+
+    PID_READ_LIST request: payload = [count][pid1_hi][pid1_lo][pid2_hi][pid2_lo]...
+    Max 3 PIDs per frame (8-byte payload limit: 1 count + 3*2 = 7 bytes).
+    """
+    count = min(len(pid_ids), 3)
+    payload = bytes([count & 0xFF])
+    for pid in pid_ids[:count]:
+        payload += bytes([(pid >> 8) & 0xFF, pid & 0xFF])
+    return compose_ids_can_extended_wire_frame(
+        message_type=0x80,  # REQUEST
+        source_address=source_address,
+        target_address=target_address,
+        message_data=0x10,  # PID_READ_LIST
+        payload=payload,
+    )
+
+
+def compose_ids_can_panic_stop_request(
+    source_address: int,
+    target_address: int,
+) -> bytes:
+    """Compose a panic stop request (emergency generator stop)."""
+    return compose_ids_can_extended_wire_frame(
+        message_type=0x80,  # REQUEST
+        source_address=source_address,
+        target_address=target_address,
+        message_data=0x11,  # PID_READ_WRITE
+        payload=bytes([0x00, 0x00, 0x01, 0x02]),  # emergency stop
+    )
+
+
 def compose_ids_can_standard_wire_frame(
     message_type: int,
     source_address: int,

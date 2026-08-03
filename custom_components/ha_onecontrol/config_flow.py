@@ -65,7 +65,8 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
 
         _LOGGER.info(
             "OneControl advertisement %s: family=%s method=%s pairing_enabled=%s "
-            "push_button=%s tlv=%s ble_capability=%s advertised_gateway_version=%s",
+            "push_button=%s tlv=%s ble_capability=%s advertised_gateway_version=%s "
+            "services=%s manufacturer_data=%s",
             discovery_info.address,
             self._gateway_family,
             capabilities.pairing_method.value,
@@ -74,6 +75,8 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
             capabilities.uses_modern_tlv,
             capabilities.ble_capability.name if capabilities.ble_capability else None,
             capabilities.advertised_gateway_version,
+            discovery_info.service_uuids,
+            discovery_info.manufacturer_data,
         )
 
     # ------------------------------------------------------------------
@@ -157,6 +160,14 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Ask the user whether their gateway uses Push-to-Pair or PIN."""
+        if (
+            user_input is None
+            and self._gateway_family == GATEWAY_FAMILY_X180T
+            and self._pairing_method in (PairingMethod.UNKNOWN, PairingMethod.NONE)
+        ):
+            self._pairing_method = PairingMethod.PUSH_BUTTON
+            return await self.async_step_confirm()
+
         if (
             user_input is None
             and self._gateway_family == GATEWAY_FAMILY_X180T

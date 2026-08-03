@@ -11,13 +11,11 @@ AUTH_SERVICE_UUID = f"00000010{UUID_BASE}"
 SEED_CHAR_UUID = f"00000011{UUID_BASE}"
 UNLOCK_STATUS_CHAR_UUID = f"00000012{UUID_BASE}"
 KEY_CHAR_UUID = f"00000013{UUID_BASE}"
-AUTH_STATUS_CHAR_UUID = f"00000014{UUID_BASE}"
 
 DATA_SERVICE_UUID = f"00000030{UUID_BASE}"
 DATA_WRITE_CHAR_UUID = f"00000033{UUID_BASE}"
 DATA_READ_CHAR_UUID = f"00000034{UUID_BASE}"
 
-CAN_SERVICE_UUID = f"00000000{UUID_BASE}"
 CAN_WRITE_CHAR_UUID = f"00000001{UUID_BASE}"
 CAN_READ_CHAR_UUID = f"00000002{UUID_BASE}"
 CAN_VERSION_CHAR_UUID = f"00000004{UUID_BASE}"
@@ -25,14 +23,17 @@ PASSWORD_UNLOCK_CHAR_UUID = f"00000005{UUID_BASE}"
 
 X180T_DISCOVERY_SERVICE_UUID = f"0000000f{UUID_BASE}"
 
-DISCOVERY_SERVICE_UUID = f"00000041{UUID_BASE}"
-
 # ---------------------------------------------------------------------------
 # Manufacturer / Advertisement
 # ---------------------------------------------------------------------------
 LIPPERT_MANUFACTURER_ID = 0x0499        # 1177 decimal — Lippert Components
 LIPPERT_MANUFACTURER_ID_ALT = 0x05C7   # 1479 decimal — LCI X4T2 / PIN-based gateway variant
 GATEWAY_NAME_PREFIX = "LCIRemote"      # All known gateway models advertise this name prefix
+
+# Official IDS-CAN product and device identifiers
+X180T_PRODUCT_ID = 163  # MULTIFUNCTION_UNITY_X180T_ASSEMBLY (kept for reference from APK descriptors)
+ONECONTROL_ANDROID_MOBILE_APP_PRODUCT_ID = 46
+ANDROID_MOBILE_DEVICE_TYPE = 22
 
 # ---------------------------------------------------------------------------
 # TEA Encryption Constants (public / standard)
@@ -51,7 +52,6 @@ DEFAULT_GATEWAY_PIN = "090336"
 # ---------------------------------------------------------------------------
 # Timing (seconds)
 # ---------------------------------------------------------------------------
-AUTH_TIMEOUT = 10.0
 UNLOCK_VERIFY_DELAY = 0.5
 NOTIFICATION_ENABLE_DELAY = 0.2
 BLE_MTU_SIZE = 185
@@ -96,6 +96,52 @@ CMD_ACTION_GENERATOR = 0x42
 CMD_ACTION_DIMMABLE = 0x43
 CMD_ACTION_RGB = 0x44
 CMD_ACTION_HVAC = 0x45
+CMD_ACTION_GENERATOR_PRIME = 0x46  # GeneratorGenie prime (fuel pump prime before start)
+
+# ---------------------------------------------------------------------------
+# Generator PID addresses (IDS-CAN parameter identifiers)
+# Source: IDS.Core.IDS_CAN.Descriptors (4.6.4.0) from Android APK
+# ---------------------------------------------------------------------------
+# These PIDs are read/written via IDS-CAN REQUEST PID_READ_WRITE (0x11) frames.
+# For MyRvLink gateways, PID access uses GetDevicePid / SetDevicePid commands
+# (not yet implemented -- requires further protocol reverse-engineering).
+
+# Generator configuration PIDs (canonical IDs TBD -- these are placeholder
+# identifiers extracted from the APK descriptor names; actual IDS-CAN PID
+# addresses will be discovered via PID_READ_LIST once implemented)
+GEN_PID_AUTO_START_LOW_VOLTAGE = "GENERATOR_AUTO_START_LOW_VOLTAGE"
+GEN_PID_AUTO_START_LOW_VOLTAGE_ENABLED = "GENERATOR_AUTO_START_LOW_VOLTAGE_ENABLED"
+GEN_PID_AUTO_START_HI_TEMP_C = "GENERATOR_AUTO_START_HI_TEMP_C"
+GEN_PID_QUIET_HOURS_ENABLED = "GENERATOR_QUIET_HOURS_ENABLED"
+GEN_PID_QUIET_HOURS_START_TIME = "GENERATOR_QUIET_HOURS_START_TIME"
+GEN_PID_QUIET_HOURS_END_TIME = "GENERATOR_QUIET_HOURS_END_TIME"
+GEN_PID_AUTO_RUN_DURATION_MINUTES = "GENERATOR_AUTO_RUN_DURATION_MINUTES"
+GEN_PID_AUTO_RUN_MIN_OFF_TIME_MINUTES = "GENERATOR_AUTO_RUN_MIN_OFF_TIME_MINUTES"
+GEN_PID_GENERATOR_TYPE = "GENERATOR_TYPE"
+GEN_PID_CUMMINS_ONAN_FAULT_CODE = "CUMMINS_ONAN_GENERATOR_FAULT_CODE"
+GEN_PID_FUEL_TANK = "GENERATOR_FUEL_TANK"
+
+# Human-readable labels for generator PIDs (used in number entity names)
+GEN_PID_LABELS = {
+    GEN_PID_AUTO_START_LOW_VOLTAGE: "Auto Start Low Voltage",
+    GEN_PID_AUTO_START_LOW_VOLTAGE_ENABLED: "Auto Start Low Voltage Enabled",
+    GEN_PID_AUTO_START_HI_TEMP_C: "Auto Start High Temp",
+    GEN_PID_QUIET_HOURS_ENABLED: "Quiet Hours Enabled",
+    GEN_PID_QUIET_HOURS_START_TIME: "Quiet Hours Start Time",
+    GEN_PID_QUIET_HOURS_END_TIME: "Quiet Hours End Time",
+    GEN_PID_AUTO_RUN_DURATION_MINUTES: "Auto Run Duration",
+    GEN_PID_AUTO_RUN_MIN_OFF_TIME_MINUTES: "Auto Run Min Off Time",
+}
+
+# Generator PID units (for HA number entities)
+GEN_PID_UNITS = {
+    GEN_PID_AUTO_START_LOW_VOLTAGE: "V",
+    GEN_PID_AUTO_START_HI_TEMP_C: "°C",
+    GEN_PID_QUIET_HOURS_START_TIME: "min",
+    GEN_PID_QUIET_HOURS_END_TIME: "min",
+    GEN_PID_AUTO_RUN_DURATION_MINUTES: "min",
+    GEN_PID_AUTO_RUN_MIN_OFF_TIME_MINUTES: "min",
+}
 
 # ---------------------------------------------------------------------------
 # HVAC mode constants (from INTERNALS.md § HVAC Command)
@@ -104,10 +150,7 @@ HVAC_MODE_OFF = 0
 HVAC_MODE_HEAT = 1
 HVAC_MODE_COOL = 2
 HVAC_MODE_HEAT_COOL = 3
-HVAC_MODE_SCHEDULE = 4
-
-HVAC_SOURCE_GAS = 0
-HVAC_SOURCE_HEAT_PUMP = 1
+HVAC_MODE_SCHEDULE = 4  # Programmed schedule mode (APK parity)
 
 HVAC_FAN_AUTO = 0
 HVAC_FAN_HIGH = 1
@@ -131,6 +174,7 @@ HVAC_CAP_GAS = 0x01
 HVAC_CAP_AC = 0x02
 HVAC_CAP_HEAT_PUMP = 0x04
 HVAC_CAP_MULTISPEED_FAN = 0x08
+HVAC_CAP_ELECTRIC_HEAT = 0x10  # Electric heat (distinct from gas per APK IsElectricHeat)
 
 # Heat source preset names (match Android / HA climate preset_mode)
 HVAC_PRESET_GAS = "Prefer Gas"
@@ -140,9 +184,6 @@ HVAC_PRESET_NONE = "none"
 # ---------------------------------------------------------------------------
 # Cover status byte values (state-only, no commands — INTERNALS.md § Cover)
 # ---------------------------------------------------------------------------
-COVER_STOPPED = 0xC0
-COVER_OPENING = 0xC2
-COVER_CLOSING = 0xC3
 
 # ---------------------------------------------------------------------------
 # Metadata protocol constants (INTERNALS.md § Device Metadata Retrieval)

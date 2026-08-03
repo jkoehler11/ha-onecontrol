@@ -1,13 +1,12 @@
 """Cover platform for OneControl BLE integration.
 
-IMPORTANT: Covers are STATE-ONLY — no open/close/stop commands are sent.
-Per INTERNALS.md safety decision:
-  "Cover control was intentionally disabled... RV awnings and slides have
-   no automatic safety mechanisms. The 19A/39A H-bridge motors could cause
-   damage or injury without manual supervision."
-
 Creates Cover entities that show the current state (opening/closing/stopped)
-but do NOT allow control via Home Assistant.
+and allow control via open/close/stop commands.
+
+Also creates companion button entities for advanced H-Bridge commands:
+  - Auto Open / Auto Close (weather-sensing awning modes)
+  - Clear Latch (reset motor fault latch)
+  - Home Reset (recalibrate motor position)
 
 Reference: INTERNALS.md § Cover / Slide / Awning
 """
@@ -17,13 +16,21 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from homeassistant.components.button import ButtonEntity
 from homeassistant.components.cover import (
     CoverDeviceClass,
     CoverEntity,
     CoverEntityFeature,
 )
+
+
+def _is_valid_device_id(device_id: int) -> bool:
+    """Check if device_id is valid (not a sentinel value like 0x0000)."""
+    # Exclude invalid/placeholder device IDs
+    invalid_ids = {0x00, 0x8F, 0x59}
+    return device_id not in invalid_ids
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_ADDRESS
+from homeassistant.const import CONF_ADDRESS, EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -31,9 +38,20 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import OneControlCoordinator
+from .protocol.commands import CommandBuilder
 from .protocol.events import CoverStatus
 
 _LOGGER = logging.getLogger(__name__)
+
+# ── Advanced H-Bridge button definitions ───────────────────────────────────
+
+_HBRIDGE_BUTTONS: tuple[tuple[int, str, str, str], ...] = (
+    # (command_byte, suffix, label, icon)
+    (CommandBuilder.HBRIDGE_AUTO_OPEN_CMD, "auto_open", "Auto Open", "mdi:weather-sunny"),
+    (CommandBuilder.HBRIDGE_AUTO_CLOSE_CMD, "auto_close", "Auto Close", "mdi:weather-night"),
+    (CommandBuilder.HBRIDGE_CLEAR_LATCH_CMD, "clear_latch", "Clear Latch", "mdi:lock-reset"),
+    (CommandBuilder.HBRIDGE_HOME_RESET_CMD, "home_reset", "Home Reset", "mdi:home-import-outline"),
+)
 
 
 async def async_setup_entry(
@@ -50,25 +68,59 @@ async def async_setup_entry(
     @callback
     def _on_event(event: Any) -> None:
         if isinstance(event, CoverStatus):
+            if not _is_valid_device_id(event.device_id):
+                return
             key = f"{event.table_id:02x}:{event.device_id:02x}"
             if key not in discovered:
                 discovered.add(key)
-                async_add_entities(
-                    [OneControlCover(coordinator, address, event.table_id, event.device_id)]
-                )
+                _add_cover_and_buttons(coordinator, address, event.table_id, event.device_id, async_add_entities)
 
     coordinator.register_event_callback(_on_event)
 
     for key, cov in coordinator.covers.items():
         if key not in discovered:
             discovered.add(key)
-            async_add_entities(
-                [OneControlCover(coordinator, address, cov.table_id, cov.device_id)]
+            _add_cover_and_buttons(coordinator, address, cov.table_id, cov.device_id, async_add_entities)
+
+
+def _add_cover_and_buttons(
+    coordinator: OneControlCoordinator,
+    address: str,
+    table_id: int,
+    device_id: int,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Create the cover entity and its companion advanced-command buttons."""
+    entities: list = [OneControlCover(coordinator, address, table_id, device_id)]
+
+    mac = address.replace(":", "").lower()
+    device_info = DeviceInfo(
+        identifiers={(DOMAIN, address)},
+        name=f"OneControl {address}",
+        manufacturer="Lippert / LCI",
+        model="BLE Gateway",
+        connections={("bluetooth", address)},
+    )
+
+    for cmd_byte, suffix, label, icon in _HBRIDGE_BUTTONS:
+        entities.append(
+            OneControlCoverButton(
+                coordinator=coordinator,
+                device_info=device_info,
+                unique_id=f"{mac}_cover_{table_id:02x}_{device_id:02x}_{suffix}",
+                name=label,
+                icon=icon,
+                table_id=table_id,
+                device_id=device_id,
+                command_byte=cmd_byte,
             )
+        )
+
+    async_add_entities(entities)
 
 
 class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
-    """Cover entity — state-only, no control commands.
+    """Cover entity with open/close/stop control.
 
     Shows opening / closing / stopped state from the H-Bridge status event.
     Position is exposed when available (0xFF means unknown).
@@ -76,7 +128,21 @@ class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
 
     _attr_has_entity_name = True
     _attr_device_class = CoverDeviceClass.AWNING
-    _attr_supported_features = CoverEntityFeature(0)  # No control features
+    _attr_supported_features = (
+        CoverEntityFeature.OPEN
+        | CoverEntityFeature.CLOSE
+        | CoverEntityFeature.STOP
+    )
+
+    @property
+    def supported_features(self) -> int:
+        """Return supported features for this cover entity."""
+        _LOGGER.debug(
+            "Cover supported_features for %s = %s",
+            self._key,
+            int(self._attr_supported_features),
+        )
+        return int(self._attr_supported_features)
 
     def __init__(
         self,
@@ -90,7 +156,7 @@ class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
         mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_cover_{device_id:02x}"
+        self._attr_unique_id = f"{mac}_cover_{table_id:02x}_{device_id:02x}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",
@@ -106,22 +172,29 @@ class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data_healthy and self._key in self.coordinator.covers
+        # Cover controls should remain available once the device has been
+        # discovered, and while the gateway link is connected.
+        available = self._key in self.coordinator.covers or self.coordinator.connected
+        _LOGGER.debug("Cover available for %s = %s", self._key, available)
+        return available
 
     @property
     def is_closed(self) -> bool | None:
-        """Return True if the cover is fully closed (stopped, position 0 or unknown)."""
+        """Return True if the cover is fully closed.
+
+        Position 0 = fully retracted/closed.
+        None returned when position is unknown (0xFF or absent).
+        """
         cov = self.coordinator.covers.get(self._key)
         if not cov:
             return None
-        # If stopped and position is 0% → closed
-        # If position unknown (0xFF) and stopped → assume closed
-        if cov.ha_state == "closed":
-            return True
+        # Motor is running — state is transitional
         if cov.ha_state in ("opening", "closing"):
             return False
-        # stopped with unknown or partial position
-        return None if cov.position == 0xFF else (cov.position == 0)
+        # Motor stopped — use position if available
+        if cov.position is None or cov.position == 0xFF:
+            return None
+        return cov.position == 0
 
     @property
     def is_opening(self) -> bool:
@@ -137,7 +210,7 @@ class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
     def current_cover_position(self) -> int | None:
         """Position 0-100, None if unknown."""
         cov = self.coordinator.covers.get(self._key)
-        if not cov or cov.position == 0xFF:
+        if not cov or cov.position is None or cov.position == 0xFF:
             return None
         return cov.position
 
@@ -148,21 +221,24 @@ class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
             return {}
         return {
             "raw_status": f"0x{cov.status:02X}",
-            "control_disabled": True,
-            "safety_note": "Cover control intentionally disabled — no limit switches",
+            "table_id": self._table_id,
+            "device_id": self._device_id,
         }
 
     async def async_open_cover(self, **kwargs: Any) -> None:
-        """Intentionally not implemented — safety."""
-        _LOGGER.warning("Cover open command blocked — safety: no limit switches")
+        """Open the cover (extend motor)."""
+        _LOGGER.info("Cover open requested key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
+        await self.coordinator.async_cover(self._table_id, self._device_id, 0x01)
 
     async def async_close_cover(self, **kwargs: Any) -> None:
-        """Intentionally not implemented — safety."""
-        _LOGGER.warning("Cover close command blocked — safety: no limit switches")
+        """Close the cover (retract motor)."""
+        _LOGGER.debug("Cover close key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
+        await self.coordinator.async_cover(self._table_id, self._device_id, 0x02)
 
     async def async_stop_cover(self, **kwargs: Any) -> None:
-        """Intentionally not implemented — safety."""
-        _LOGGER.warning("Cover stop command blocked — safety: no limit switches")
+        """Stop the cover motor."""
+        _LOGGER.debug("Cover stop key=%s table=%d device=0x%02X", self._key, self._table_id, self._device_id)
+        await self.coordinator.async_cover(self._table_id, self._device_id, 0x00)
 
     async def async_will_remove_from_hass(self) -> None:
         self._unsub()
@@ -175,3 +251,52 @@ class OneControlCover(CoordinatorEntity[OneControlCoordinator], CoverEntity):
             and event.device_id == self._device_id
         ):
             self.async_write_ha_state()
+
+
+class OneControlCoverButton(CoordinatorEntity[OneControlCoordinator], ButtonEntity):
+    """Button entity for an advanced H-Bridge cover command.
+
+    Sends a single-fire command (no repeating) to the gateway for
+    operations like Auto Open, Auto Close, Clear Latch, or Home Reset.
+    """
+
+    _attr_has_entity_name = True
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(
+        self,
+        coordinator: OneControlCoordinator,
+        device_info: DeviceInfo,
+        unique_id: str,
+        name: str,
+        icon: str,
+        table_id: int,
+        device_id: int,
+        command_byte: int,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = unique_id
+        self._attr_name = name
+        self._attr_icon = icon
+        self._attr_device_info = device_info
+        self._table_id = table_id
+        self._device_id = device_id
+        self._command_byte = command_byte
+
+    @property
+    def available(self) -> bool:
+        """Available when the gateway is connected."""
+        return self.coordinator.connected
+
+    async def async_press(self) -> None:
+        """Send the advanced cover command to the gateway."""
+        _LOGGER.info(
+            "Cover button '%s' pressed table=%d device=0x%02X cmd=0x%02X",
+            self._attr_name,
+            self._table_id,
+            self._device_id,
+            self._command_byte,
+        )
+        await self.coordinator.async_cover_advanced(
+            self._table_id, self._device_id, self._command_byte,
+        )

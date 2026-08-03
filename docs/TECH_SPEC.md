@@ -135,6 +135,7 @@ Experimental X180T support is based on official app handling rather than local h
 - Official app stores an empty CAN password for X180T (`string.Empty`) while still using BLE pairing metadata and key/seed exchange.
 - X180T uses CAN-BLE runtime service `00000000-0200-a58e-e411-afe28044e62c` after pairing/bonding.
 - X180T key/seed cipher is `0xC81D7F20`.
+ - Official IDS-CAN `PRODUCT_ID` observed for X180T: `163` (kept in code as `X180T_PRODUCT_ID` for reference).
 
 The first experimental release classified X180T and routed it to CAN-BLE, but field logs showed that pre-connect BlueZ Just Works pairing could still fail before service discovery. The follow-up changed X180T push-button handling to more closely match official app ordering: register a Just Works agent, connect GATT first, then call `pair()` post-connect. If bonding or `CAN_READ` subscription fails, the coordinator now fails the attempt instead of marking the gateway authenticated and attempting CAN writes without service discovery.
 
@@ -294,3 +295,97 @@ Recent trajectory includes:
 3. Stage multi-part payloads and commit only on validated terminal frames.
 4. Add observability counters before introducing new protocol surfaces.
 5. Use guarded optimistic windows where delayed echoes are common.
+
+## 14. APK Parity Analysis (June 2025)
+
+Analysis of the official OneControl Android APK (Xamarin/.NET, decompiled assemblies)
+identified the following gaps between the mobile app and this HA integration.
+
+### 14.1 Implemented (this analysis)
+
+- **HVAC Schedule Mode (heat_mode=4):** The APK supports a programmed schedule mode
+  (`ProgramedCommand` in ZoneStatus). Added `HVAC_MODE_SCHEDULE = 4` and mapped it to
+  HA `HVACMode.AUTO`. Previously unmapped mode 4 fell through to OFF.
+
+- **Electric Heat Capability:** The APK distinguishes gas heat from electric heat
+  (`IsElectricHeat` capability). Added `HVAC_CAP_ELECTRIC_HEAT = 0x10` and detection
+  for `active_status=4` (electric heat active). Previously only gas (status 5-6) and
+  heat pump (status 3) were detected; electric heat was visible as HEATING action but
+  not tracked as a capability.
+
+### 14.2 APK Features Present in HA (Verified)
+
+| APK Feature | HA Implementation | Status |
+|-------------|-------------------|--------|
+| Relay/latching switches | `switch.py` — OneControlSwitch | Matches |
+| Generator start/stop | `switch.py` — OneControlGeneratorSwitch | Matches |
+| Generator status (state, battery, temp) | `sensor.py` — Generator/Battery/Temp sensors | Matches |
+| Generator quiet hours | `binary_sensor.py` — OneControlGeneratorQuietHours | Matches |
+| Dimmable lights | `light.py` — OneControlDimmableLight + effects (Blink/Swell) | Matches |
+| RGB lights | `light.py` — OneControlRgbLight + effects (Solid/Blink/Transitions/Rainbow) | Matches |
+| HVAC zones (mode, fan, setpoints) | `climate.py` — OneControlClimate + presets | Matches |
+| HVAC capabilities (Gas, AC, HeatPump, Fan) | `coordinator.py` — observed_hvac_capability | Matches |
+| Covers/awnings/slides (open/close/stop) | `cover.py` — OneControlCover | Matches |
+| Advanced H-bridge commands (Auto Open/Close, Clear Latch, Home Reset) | `cover.py` — OneControlCoverButton | Matches |
+| Tank levels (fresh/grey/black/fuel) | `sensor.py` — OneControlTankSensor | Matches |
+| Tank alerts (threshold/connectivity) | `sensor.py` — OneControlTankAlertSensor | Matches |
+| Leveler position/status | `sensor.py` — OneControlLevelerPositionSensor | Matches |
+| Hour meter | `sensor.py` — OneControlHourMeterSensor | Matches |
+| System voltage/temperature | `sensor.py` — Voltage/Temperature/AcVoltage sensors | Matches |
+| In-motion lockout detection | `binary_sensor.py` — OneControlInMotionLockout | Matches |
+| Clear lockout button | `button.py` — OneControlClearLockoutButton | Matches |
+| Refresh metadata | `button.py` — OneControlRefreshMetadataButton | Matches |
+| DTC (Diagnostic Trouble Codes) | `protocol/dtc_codes.py` — 1934 codes | Matches |
+| Function name mapping | `protocol/function_names.py` — 445 function names | Matches |
+| IDS-CAN wire protocol | `protocol/ids_can_wire.py` — frame parsing + composition | Matches |
+| COBS/CRC framing | `protocol/cobs.py`, `protocol/crc8.py` | Matches |
+| TEA encryption (Step 1/2, CAN-BLE key/seed) | `protocol/tea.py` | Matches |
+
+### 14.3 APK Features NOT in HA
+
+| APK Feature | Reason | Priority |
+|-------------|--------|----------|
+| **Generator Auto-Start** (`IsAutoRunOnTempAvailable`, timers, schedules) | Requires PID read/write for auto-start configuration. PID addresses need reverse-engineering from APK. | Medium |
+| **Leveler Control** (Type 1/3/4/5 button commands, jack movement, calibration, zero point, home jacks, RF remote pairing, cold weather mode, auto-level, auto-ground, panic stop) | Requires IDS-CAN REMOTE_CONTROL session management and leveler-specific command encoding. `IDS_CAN_REQUEST_LEVELER_TYPE_5_CONTROL` (0x60) is defined in `ids_can_wire.py`. | Medium |
+| **DC Power / Battery Monitor** (chemistry, capacity, charge state) | Separate device type with its own PIDs. Not exposed via MyRvLink events. | Low |
+| **Tire Linc / TPMS** (tire pressure, temperature, sensor battery) | Companion BLE device (`com.idselectronics.linctab.app_remote`), not part of OneControl gateway. | Low |
+| **Camera Integration** (firmware, password, settings) | Separate device ecosystem. | Low |
+| **Firmware Update / OTA** | `MyRvLinkCommandSoftwareUpdateAuthorization` exists in APK DLLs but is complex and risky without hardware testing. | Low |
+| **Cloud/Remote Access** (MyRvCloud, RvCloudIoT) | Deliberately local-only for HA. Cloud DLLs: `OneControl.Remote.MyRvCloud.dll`, `OneControl.Direct.RvCloudIoT.dll`. | Won't implement |
+| **TCP/IP Direct Connection** (`OneControl.Direct.MyRvLinkTcpIp.dll`) | BLE-only for HA by design. | Won't implement |
+| **Light Groups** (All Lights On/Off) | `AllLightsGroupBehaviorCapability` in APK. Could be implemented as HA scripts. | Low |
+| **Awning Wind Sensor / Auto-Protect** | `awning_sensor_wind_alert`, `awning_auto_protected`. May require separate BLE accessory (`IdsCanAccessoryBle`). | Low |
+| **Electronic Sway Control** | `electronic_sway_control`, `IsSavingSwayFeature`. Separate chassis system. | Low |
+| **Anti-Lock Brakes** | `anti_lock_brakes`, `abs_connect`. Separate chassis system. | Low |
+| **Sleep Timer** | `sleep_timer`, `SleepTimerValueText`. Convenience feature, not critical. | Low |
+| **Door Lock Power Modes** (normal/low/storage) | Power mode configuration beyond basic lock state. | Low |
+
+### 14.4 Device Categories from APK
+
+The APK organizes devices into the following UI groups (from `OneControl.Devices.dll`):
+
+- **Bed Lifts** — TV lifts, bed lifts, roof lifts
+- **Leveling** — Levelers Type 1-6, stabilizers, jacks
+- **Lighting** — All light types (dimmable, RGB, relay)
+- **Slides** — Room slides (bedroom, kitchen, etc.)
+- **Stabilizers** — Front/rear/left/right stabilizers
+- **TV Lifts** — TV lift mechanisms
+- **Vent Covers** — Bath/kitchen/living room vent covers
+- **Router** — Network bridge, WiFi bridge
+
+HA maps these to native entity types (cover, light, switch) based on function name.
+
+### 14.5 HVAC Capability Byte Verification
+
+APK capability flags vs HA implementation:
+
+| APK Flag | HA Constant | Bit | Detected By |
+|----------|-------------|-----|-------------|
+| `HasAirConditioner` | `HVAC_CAP_AC` | 0x02 | active_status=2 |
+| `HasHeatPump` | `HVAC_CAP_HEAT_PUMP` | 0x04 | active_status=3 |
+| `IsGasHeat` | `HVAC_CAP_GAS` | 0x01 | active_status=5,6 |
+| `IsElectricHeat` | `HVAC_CAP_ELECTRIC_HEAT` | 0x10 | active_status=4 (NEW) |
+| `IsMultiSpeedFan` | `HVAC_CAP_MULTISPEED_FAN` | 0x08 | fan_mode=2 (low) |
+
+These match the APK's `OnDeviceCapabilityChanged` event handling in
+`LogicalDeviceClimateZone`.

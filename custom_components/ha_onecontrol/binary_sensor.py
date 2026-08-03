@@ -21,6 +21,13 @@ from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
 )
+
+
+def _is_valid_device_id(device_id: int) -> bool:
+    """Check if device_id is valid (not a sentinel value like 0x0000)."""
+    # Exclude invalid/placeholder device IDs
+    invalid_ids = {0x00, 0x8F, 0x59}
+    return device_id not in invalid_ids
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, EntityCategory
 from homeassistant.core import HomeAssistant, callback
@@ -56,6 +63,8 @@ async def async_setup_entry(
     @callback
     def _on_event(event: Any) -> None:
         if isinstance(event, GeneratorStatus):
+            if not _is_valid_device_id(event.device_id):
+                return
             key = f"{event.table_id:02x}:{event.device_id:02x}"
             if key not in discovered_gen_quiet:
                 discovered_gen_quiet.add(key)
@@ -253,7 +262,7 @@ class OneControlGeneratorQuietHours(
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
         mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_gen_quiet_{device_id:02x}"
+        self._attr_unique_id = f"{mac}_gen_quiet_{table_id:02x}_{device_id:02x}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",
