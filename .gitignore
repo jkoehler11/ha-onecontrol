@@ -15,9 +15,14 @@ venv/
 *.log
 .DS_Store
 
+CLAUDE.md
+
 # Working context / analysis docs (local use only)
 WORKSPACE_CURRENT_STATE_ANALYSIS.md
 TEST_PLAN.md
 BT_ADAPTER_PINNING.md
 BT
 .vscode/
+
+# Dev-only scripts (deploy helper) — not part of the shipped integration
+scripts/
