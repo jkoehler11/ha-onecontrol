@@ -158,6 +158,16 @@ _CAN_COMMAND_VERIFY_POLL_S = 0.05
 # How often to resend an OPEN/CLOSE cover COMMAND so the motor keeps running
 # (device expects repeated COMMANDs while the button is conceptually held).
 _COVER_COMMAND_REPEAT_S = 0.2
+# Safety: never let a repeated open/close cover COMMAND run past this many
+# seconds without an explicit STOP. If a STOP is dropped (or a session/button
+# gets stuck), the repeater would otherwise run the motor indefinitely and can
+# damage the awning/slide. Added after a runaway awning event (2026-09-03).
+_COVER_SAFETY_TIMEOUT_S = 6.0
+# REMOTE_CONTROL session heartbeat cadence. The X180T motor controller
+# terminates the session with RESPONSE.TIMEOUT (0x0F) after ~1s of
+# inactivity, so we must heartbeat well under that window (observed
+# 2026-08-27: a 4s heartbeat let the session die mid-run).
+_RC_SESSION_HEARTBEAT_S = 0.5
 # Function codes for definite on/off relay loads that are NEVER dimmable or RGB.
 # Light function codes are intentionally excluded: any light can be wired as a
 # relay, dimmable, or RGB device — we cannot tell from function code alone which
@@ -193,6 +203,17 @@ _TANK_SEED_FUNCTION_CODES: frozenset[int] = frozenset({
 # IDS-CAN device types that represent H-bridge / cover-capable devices.
 _CAN_HBRIDGE_DEVICE_TYPES: frozenset[int] = frozenset({5, 6, 32, 33})
 _COVER_STATE_STATUS_BYTES: tuple[int, ...] = (0x00, 0xC0, 0xC2, 0xC3)
+# HA cover direction -> IDS-CAN RELAY_TYPE_2 output-state byte.
+# HA logical cover direction -> IDS-CAN COMMAND_MODE byte (decompiled from the
+# official app's LogicalDeviceRelayHBridgeMomentaryCommandType2.ToCommand, which
+# maps RelayHBridgeDirection Forward(2)->1, Reverse(3)->2, Stop(0)->0):
+#   open/extend  = 0x01 (FORWARD)
+#   close/retract = 0x02 (REVERSE)
+#   stop = 0x00
+# (Verified 2026-08-29: sending 0x02 for "open" made the awning report 0xC3 =
+# reverse/closing — the old 0x02/0x03 mapping was the RELAY_TYPE_2_OUTPUT_STATE
+# STATUS enum, not the command byte.)
+_CAN_HBRIDGE_DIRECTION_BYTE: dict[int, int] = {0x00: 0x00, 0x01: 0x01, 0x02: 0x02}
 
 
 def _device_key(table_id: int, device_id: int) -> str:
@@ -338,13 +359,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.gateway_pin: str = entry.data.get(CONF_GATEWAY_PIN, DEFAULT_GATEWAY_PIN)
 
         # ── PIN-based pairing (MyRVLink PIN gateways) ─────────────────
-        # Do NOT default to "push_button": a missing method is unknown, not a
-        # push-to-pair assertion.  Real entries always store the user's choice
-        # (config flow), so this default only guards malformed/legacy entries —
-        # leave it UNKNOWN so is_pin_gateway is False without implying the method.
-        self._pairing_method: str = entry.data.get(
-            CONF_PAIRING_METHOD, "unknown"  # PairingMethod.UNKNOWN.value
-        )
+        self._pairing_method: str = entry.data.get(CONF_PAIRING_METHOD, "push_button")
         self._gateway_family: str = entry.data.get(
             CONF_GATEWAY_FAMILY, GATEWAY_FAMILY_LEGACY
         )
@@ -418,11 +433,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._last_metadata_crc: int | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._reconnect_task: asyncio.Task | None = None
-        # Terminal teardown flag.  Set once in async_disconnect (unload / stale
-        # supersession); prevents this instance from ever reconnecting again, so
-        # an unloaded coordinator can't keep running as a "zombie" alongside its
-        # replacement on the shared adapter.
-        self._closed: bool = False
         self._reconnect_generation: int = 0
         self._consecutive_failures: int = 0
         self._last_lockout_clear: float = 0.0
@@ -436,12 +446,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._can_read_subscribed: bool = False
         self._can_device_types: dict[int, int] = {}  # source_address → IDS-CAN device_type
         self._invalid_can_sources: set[int] = set()  # source_address values we know are invalid/ignored
-        # NETWORK (mt=0x00) frames are broadcast by EVERY node on the IDS-CAN
-        # bus, each carrying its own protocol version and in-motion-lockout
-        # bits.  Track them per source so gateway-level state is a stable
-        # aggregate instead of whatever frame arrived last.
-        self._can_protocol_by_source: dict[int, int] = {}  # source_address → protocol version
-        self._can_lockout_by_source: dict[int, int] = {}  # source_address → lockout level
         # Commands queued while CAN BLE gateway is between connections.
         # Tuple: (frame_bytes, enqueue_monotonic, device_id)
         # device_id is needed so flush can open the REMOTE_CONTROL session first.
@@ -805,14 +809,18 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Cancel any repeating open/close for this device
             self._stale_cover_directions.pop(device_id, None)
             self._cancel_cover_task(device_id)
-            # Restart heartbeat if we killed it during cover operation
-            if self._rc_heartbeat_task is None or self._rc_heartbeat_task.done():
-                if self._client and self._connected and self._can_read_subscribed:
-                    self._rc_heartbeat_task = self.hass.async_create_background_task(
-                        self._rc_session_heartbeat(self._client, self._rc_session_target or device_id),
-                        name="ha_onecontrol_rc_heartbeat",
-                    )
             if self._client and self._connected and self._can_read_subscribed:
+                # Stop also requires an active REMOTE_CONTROL session before the
+                # motor controller accepts the frame.
+                await self._advertise_can_local_host_identity(
+                    self._client, reason="pre-cover-stop", force=True
+                )
+                if not await self._ensure_remote_control_session(self._client, device_id):
+                    _LOGGER.warning(
+                        "CAN BLE: cover STOP skipped — REMOTE_CONTROL activation failed for device=0x%02X",
+                        device_id,
+                    )
+                    return
                 frame = compose_ids_can_extended_wire_frame(
                     message_type=0x82,
                     source_address=self._gateway_can_address,
@@ -849,24 +857,34 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.hass.async_create_task(self.async_connect())
             return
 
-        # OPEN / CLOSE: start repeating OPEN/CLOSE via shared state
+        # OPEN / CLOSE: the awning/slide are MomentaryHBridgeType2 (33) motors
+        # that only run while the command is actively HELD — like the physical
+        # panel button. A single COMMAND frame energizes the H-bridge for ~1s
+        # before the controller de-energizes it, so we repeat the direction
+        # COMMAND every _COVER_COMMAND_REPEAT_S while the cover is
+        # opening/closing; STOP cancels the repeater. The REMOTE_CONTROL session
+        # (kept alive by _rc_session_heartbeat) must be active for COMMAND
+        # frames to be accepted at all.
         if direction & 0xFF in (0x01, 0x02):
-            # Bump generation so any existing repeater for this device exits
+            # Remap HA logical direction to the IDS-CAN COMMAND_MODE byte:
+            #   0x01 (open)  -> 0x01 FORWARD/EXTEND
+            #   0x02 (close) -> 0x02 REVERSE/RETRACT
+            can_direction = _CAN_HBRIDGE_DIRECTION_BYTE.get(direction & 0xFF, direction & 0xFF)
+            self._stale_cover_directions[device_id] = can_direction
+
+            # Bump generation so any existing repeater for this device exits.
             gen = self._cover_gen.get(device_id, 0) + 1
             self._cover_gen[device_id] = gen
-            self._stale_cover_directions[device_id] = direction & 0xFF
 
-            # If disconnected, queue the command and connect; flush will start
-            # the repeating behaviour when connection is available.
             if not (self._client and self._connected and self._can_read_subscribed):
                 frame = compose_ids_can_extended_wire_frame(
                     message_type=0x82,
                     source_address=self._gateway_can_address,
                     target_address=device_id,
-                    message_data=direction & 0xFF,
+                    message_data=can_direction,
                     payload=b"",
                 )
-                direction_name = {0x01: "OPEN", 0x02: "CLOSE"}.get(direction & 0xFF, "UNKNOWN")
+                direction_name = {0x01: "FORWARD/EXTEND", 0x02: "REVERSE/RETRACT"}.get(can_direction, "UNKNOWN")
                 _LOGGER.info(
                     "CAN BLE: gateway disconnected — queuing cover COMMAND device=0x%02X direction=%s and reconnecting immediately",
                     device_id, direction_name,
@@ -876,24 +894,36 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.hass.async_create_task(self.async_connect())
                 return
 
-            # Gen already bumped above; old task exits on next iteration (gen mismatch).
-            # Always create a new task for the latest direction.
-            # Connected: establish session first so repeater starts immediately
+            # Establish the REMOTE_CONTROL session first: the awning/slide motor
+            # controller ignores COMMAND frames without an active session.
+            await self._advertise_can_local_host_identity(
+                self._client, reason="pre-cover-command", force=True
+            )
             session_ok = await self._ensure_remote_control_session(self._client, device_id)
             if not session_ok:
-                _LOGGER.warning("CAN BLE: cannot start cover — REMOTE_CONTROL session failed for device=0x%02X", device_id)
+                _LOGGER.warning(
+                    "CAN BLE: cover COMMAND skipped — REMOTE_CONTROL activation failed for device=0x%02X gateway_version=%s",
+                    device_id,
+                    self._can_ble_gateway_version,
+                )
                 return
-            # Kill heartbeat during cover operation — COMMAND frames keep session alive
-            if self._rc_heartbeat_task and not self._rc_heartbeat_task.done():
-                self._rc_heartbeat_task.cancel()
-                self._rc_heartbeat_task = None
-                _LOGGER.warning("CAN BLE: killed heartbeat during cover operation for device=0x%02X", device_id)
+
+            # Hold-to-run (momentary H-bridge): the awning/slide motor only runs
+            # while the direction COMMAND is actively held, exactly like the
+            # physical panel button. A single COMMAND frame energizes the
+            # H-bridge for ~1s before the controller's watchdog de-energizes it,
+            # so we repeat the direction COMMAND every _COVER_COMMAND_REPEAT_S
+            # until STOP bumps the generation. The REMOTE_CONTROL session
+            # heartbeat (_rc_session_heartbeat) keeps the session alive.
             task = self.hass.async_create_background_task(
-                self._cover_command_repeater(device_id, direction & 0xFF, gen),
+                self._cover_command_repeater(device_id, can_direction, gen),
                 name=f"ha_onecontrol_cover_{device_id:02x}",
             )
             self._cover_command_tasks[device_id] = task
-            _LOGGER.warning("CAN BLE: STARTED repeater cover %s for device=0x%02X gen=%d", "OPEN" if direction & 0xFF == 0x01 else "CLOSE", device_id, gen)
+            _LOGGER.warning(
+                "CAN BLE: STARTED cover repeater device=0x%02X direction=0x%02X gen=%d",
+                device_id, can_direction, gen,
+            )
             return
         else:
             frame = compose_ids_can_extended_wire_frame(
@@ -915,13 +945,39 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.hass.async_create_task(self.async_connect())
 
     async def _cover_command_repeater(self, device_id: int, direction: int, gen: int) -> None:
-        """Send repeated cover COMMAND frames until gen mismatch or stopped."""
-        direction_name = {0x01: "OPEN", 0x02: "CLOSE"}.get(direction & 0xFF, "UNKNOWN")
+        """Send repeated cover COMMAND frames until gen mismatch or stopped.
+
+        ``direction`` is the IDS-CAN COMMAND_MODE byte (0x01 FORWARD/EXTEND or
+        0x02 REVERSE/RETRACT) — already remapped from HA logical direction.
+        """
+        direction_name = {0x01: "FORWARD/EXTEND", 0x02: "REVERSE/RETRACT"}.get(direction & 0xFF, "UNKNOWN")
+        started = time.monotonic()
         try:
             while True:
                 # Exit if a newer command bumped the generation
                 if self._cover_gen.get(device_id, 0) != gen:
                     _LOGGER.warning("Cover repeater EXIT device=0x%02X gen=%d (current=%d)", device_id, gen, self._cover_gen.get(device_id, 0))
+                    return
+                # Safety timeout: never run the motor longer than
+                # _COVER_SAFETY_TIMEOUT_S without an explicit STOP. Prevents a
+                # runaway awning/slide if a STOP is dropped or the button gets stuck.
+                if time.monotonic() - started >= _COVER_SAFETY_TIMEOUT_S:
+                    _LOGGER.warning(
+                        "CAN BLE: cover safety timeout device=0x%02X direction=%s — sending STOP",
+                        device_id, direction_name,
+                    )
+                    if self._client and self._connected and self._can_read_subscribed:
+                        stop_frame = compose_ids_can_extended_wire_frame(
+                            message_type=0x82,
+                            source_address=self._gateway_can_address,
+                            target_address=device_id,
+                            message_data=0x00,
+                            payload=b"",
+                        )
+                        try:
+                            await self._write_can_frame(self._client, stop_frame, label="cover STOP")
+                        except Exception as exc:
+                            _LOGGER.warning("CAN BLE: cover safety STOP failed: %s", exc)
                     return
                 if not (self._client and self._connected and self._can_read_subscribed):
                     _LOGGER.warning("Cover repeater WAITING for reconnect (device=0x%02X)", device_id)
@@ -967,8 +1023,21 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Used for non-CAN BLE gateways where H-Bridge ACTION must be resent
         while the virtual "button" is held.
         """
+        started = time.monotonic()
         try:
             while True:
+                if time.monotonic() - started >= _COVER_SAFETY_TIMEOUT_S:
+                    _LOGGER.warning(
+                        "H-Bridge: cover safety timeout table=%d device=0x%02X direction=0x%02X — sending STOP",
+                        table_id, device_id, direction & 0xFF,
+                    )
+                    if self._client and self._connected:
+                        stop_cmd = self._cmd.build_action_hbridge(table_id, device_id, 0x00)
+                        try:
+                            await self.async_send_command(stop_cmd)
+                        except Exception as exc:
+                            _LOGGER.warning("H-Bridge: cover safety STOP failed: %s", exc)
+                    return
                 if not (self._client and self._connected):
                     _LOGGER.debug("H-Bridge repeater waiting for reconnect (device=0x%02X)", device_id)
                     await asyncio.sleep(0.5)
@@ -1688,23 +1757,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_connect(self) -> None:
         """Establish BLE connection and authenticate."""
-        if self._closed:
-            return
         async with self._connect_lock:
-            if self._closed or self._connected:
+            if self._connected:
                 return
             await self._do_connect()
 
     async def async_disconnect(self) -> None:
-        """Disconnect from the gateway and permanently close this coordinator.
-
-        This is a terminal teardown — it is only called when the config entry is
-        unloaded or when a stale coordinator is superseded during setup.  Set
-        ``_closed`` first so that the ``client.disconnect()`` below (which fires
-        ``_on_disconnect``) and any in-flight connect ladder cannot re-arm a
-        reconnect on this dead instance.
-        """
-        self._closed = True
+        """Disconnect from the gateway."""
         self._stop_heartbeat()
         self._cancel_startup_bootstrap()
         self._cancel_reconnect()
@@ -1723,8 +1782,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         max_attempts = 3
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
-            if self._closed:
-                return
             try:
                 await self._try_connect(attempt)
                 return
@@ -1749,9 +1806,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     await asyncio.sleep(delay)
 
         assert last_exc is not None
-
-        if self._closed:
-            return
 
         # Stale bond detection: if BlueZ reported "already bonded" at any point
         # this session but all connection attempts still failed, the bond is stale
@@ -1803,8 +1857,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not hci_adapters:
             hci_adapters = ["hci0"]
         for adapter in hci_adapters:
-            if self._closed:
-                return
             _LOGGER.info(
                 "Direct BLE connect to %s via %s", self.address, adapter,
             )
@@ -2621,7 +2673,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             version_data = bytes(await client.read_gatt_char(CAN_VERSION_CHAR_UUID))
             decoded_version = _official_can_ble_gateway_version_from_part(version_data)
             self._can_ble_gateway_version = decoded_version
-            _LOGGER.debug(
+            _LOGGER.info(
                 "CAN BLE: software part/version char=%s official_gateway_version=%s",
                 version_data.hex(),
                 decoded_version,
@@ -2883,40 +2935,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         mt = wire.message_type
         src = wire.source_address
 
-        if mt == 0x00 and decoded is not None:  # NETWORK — per-node status heartbeat
-            # Every node on the IDS-CAN bus broadcasts a NETWORK frame carrying
-            # its OWN protocol version and lockout bits (the frame's source is
-            # an endpoint device, not the gateway).  Overwriting gateway-level
-            # state from each frame made the Protocol Version sensor flap
-            # between every node's value many times a second.  Instead, record
-            # per source and aggregate:
-            #   * lockout  = MAX across nodes — the coach is in lockout if ANY
-            #     node reports it; matches the official app's
-            #     LogicalDeviceService.InMotionLockoutLevel (max of active
-            #     sources).
-            #   * protocol = MAX observed on the bus — a stable value; the coach
-            #     gateway is the highest-versioned node in practice (e.g. 20 vs
-            #     accessory 12/19).
-            # Only push a coordinator update when an aggregate actually changes,
-            # so unchanged heartbeats no longer churn HA state / the recorder.
+        if mt == 0x00 and decoded is not None:  # NETWORK — synthesize gateway_info + lockout
             proto = int(decoded.fields.get("protocol_version", 0))
             lockout = int(decoded.fields.get("in_motion_lockout_level", 0))
-            self._can_protocol_by_source[src] = proto
-            self._can_lockout_by_source[src] = lockout
-
-            agg_proto = max(self._can_protocol_by_source.values())
-            agg_lockout = max(self._can_lockout_by_source.values())
-
-            changed = (
-                self.system_lockout_level != agg_lockout
-                or self.gateway_info is None
-                or self.gateway_info.protocol_version != agg_proto
-                or self.gateway_info.device_count != len(self._can_device_types)
-            )
-
-            self.system_lockout_level = agg_lockout
+            self.system_lockout_level = lockout
             self.gateway_info = GatewayInformation(
-                protocol_version=agg_proto,
+                protocol_version=proto,
                 table_id=0,
                 device_count=max(
                     int(decoded.fields.get("device_count", 0)),
@@ -2930,8 +2954,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.gateway_info.device_count,
             )
             self._last_event_time = time.monotonic()
-            if changed:
-                self.async_set_updated_data(self._build_data())
+            self.async_set_updated_data(self._build_data())
             return
 
         if mt == 0x02 and decoded is not None:  # DEVICE_ID
@@ -3015,7 +3038,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             event = TankLevel(table_id=0, device_id=src, level=level_pct)
             if _is_valid_device_id(src):
                 self.tanks[key] = event
-                _LOGGER.info(
+                _LOGGER.debug(
                     "CAN BLE: stored tank %s level=%d%% name=%s payload=%s",
                     key,
                     level_pct,
@@ -3032,7 +3055,17 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 pos = None
             event = CoverStatus(table_id=0, device_id=src, status=status, position=pos)
             if _is_valid_device_id(src):
+                prev = self.covers.get(key)
                 self.covers[key] = event
+                if prev is None or prev.status != status:
+                    _LOGGER.info(
+                        "CAN BLE: cover DEVICE_STATUS device=0x%02X status=0x%02X (was %s) pos=%s payload=%s",
+                        src,
+                        status,
+                        "None" if prev is None else f"0x{prev.status:02X}",
+                        pos,
+                        payload.hex(),
+                    )
 
         elif dev_type == 30:  # Relay (light, switch)
             status_byte = payload[0] if len(payload) >= 1 else 0x00
@@ -3284,6 +3317,28 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     and self._client is client
                 ):
                     break
+                # Stale-connection detection.  The X180T broadcasts every ~5-10s,
+                # so 30s without any CAN event means the link has gone silent while
+                # Bleak still reports it "connected" (a zombie link).  data_healthy()
+                # uses the same 30s window; here we go one step further and force a
+                # reconnect instead of leaving entities stuck "unavailable".
+                if (
+                    self._last_event_time > 0
+                    and (time.monotonic() - self._last_event_time) > 30.0
+                ):
+                    _LOGGER.warning(
+                        "CAN BLE: no events for %.0fs — connection stale, forcing reconnect",
+                        time.monotonic() - self._last_event_time,
+                    )
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    # disconnect() normally fires _on_disconnect -> _schedule_reconnect.
+                    # If the callback didn't fire, trigger it manually so we always recover.
+                    if self._connected:
+                        self._on_disconnect(client)
+                    break
                 # Avoid interleaving broadcast keepalive traffic with
                 # REMOTE_CONTROL session open/heartbeat traffic.
                 if (
@@ -3334,20 +3389,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     continue
                 parsed = parse_ids_can_wire_frame(frame)
                 command = parsed.message_data if parsed and parsed.message_data is not None else 0x00
-                # If this is a cover OPEN/CLOSE queued while disconnected, start
-                # the repeating cover behaviour now instead of sending a single
-                # one-shot frame.
-                if parsed and parsed.message_type == 0x82 and command in (0x01, 0x02):
-                    _LOGGER.info(
-                        "CAN BLE: flushing queued cover command device=0x%02X direction=0x%02X — starting repeater",
-                        device_id,
-                        command,
-                    )
-                    # Start repeating behaviour for this device
-                    # Use the public API so behaviour is consistent.
-                    await self.async_can_cover(device_id, command)
-                    continue
-
                 current_frame = compose_ids_can_extended_wire_frame(
                     message_type=0x82,
                     source_address=self._gateway_can_address,
@@ -3381,6 +3422,14 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """ 
         payload = wire.payload
         msg = wire.message_data
+
+        _LOGGER.debug(
+            "CAN BLE: SESSION_RX msg=0x%02X payload=%s src=0x%02X dst=0x%02X",
+            msg,
+            payload.hex(),
+            wire.source_address,
+            wire.target_address,
+        )
 
         # Some gateways return single-byte IDS status responses for session
         # requests instead of full session payloads.
@@ -3717,8 +3766,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.info(
                 "CAN BLE: REMOTE_CONTROL session established for device 0x%02X", device_id
             )
-            # Start heartbeat task to keep session alive. Device closes session if no
-            # heartbeat arrives within 5 seconds, so we send every 4 seconds.
+            # Start heartbeat task to keep session alive.
             self._rc_heartbeat_task = self.hass.async_create_background_task(
                 self._rc_session_heartbeat(client, device_id),
                 name=f"ha_onecontrol_rc_heartbeat_{device_id:02x}",
@@ -3783,13 +3831,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.warning("CAN BLE: session preflight query failed: %s", exc)
 
     async def _rc_session_heartbeat(self, client: BleakClient, device_id: int) -> None:
-        """Send SESSION_HEARTBEAT (0x44) every 4 s to keep REMOTE_CONTROL session alive.
+        """Send SESSION_HEARTBEAT (0x44) to keep the REMOTE_CONTROL session alive.
 
-        The device closes the session if no heartbeat arrives within 5 s.
+        The X180T motor controller terminates the session with RESPONSE.TIMEOUT
+        (0x0F) after ~1s of inactivity, so heartbeat every
+        ``_RC_SESSION_HEARTBEAT_S`` (0.5s) to keep the momentary H-bridge
+        energized while the awning/slide runs.
         """
         try:
             while self._rc_session_open and self._rc_session_target == device_id and self._connected:
-                await asyncio.sleep(4.0)
+                await asyncio.sleep(_RC_SESSION_HEARTBEAT_S)
                 if not (self._rc_session_open and self._rc_session_target == device_id and self._connected):
                     break
                 hb_frame = compose_ids_can_extended_wire_frame(
@@ -4767,13 +4818,17 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._initial_get_devices_sent = False
         self._has_can_write = False
         self._is_can_ble = False
-        self._can_device_types = {}
-        self._can_protocol_by_source.clear()
-        self._can_lockout_by_source.clear()
+        # _can_device_types, _invalid_can_sources and _can_ble_confirmed are
+        # deliberately NOT cleared here.  They describe the IDS-CAN bus topology
+        # and the gateway's CAN-BLE identity — learned facts that must SURVIVE
+        # the X180T's frequent (~5-10s) disconnect/reconnect cycles.  Clearing
+        # them on every disconnect dropped DEVICE_STATUS frames for a full
+        # broadcast cycle after each reconnect and defeated data_healthy()'s 30s
+        # staleness window (which depends on _can_ble_confirmed staying True
+        # between cycles), causing entities to flicker "unavailable" — the
+        # "stale connection" symptom.
         # Tear down any open REMOTE_CONTROL session — will be re-opened on next connect.
         self._can_read_subscribed = False
-        self._invalid_can_sources.clear()
-        self._can_ble_confirmed = False
         self._can_local_host_claimed = False
         self._can_local_host_identity_last_tx = 0.0
         self._rc_session_open = False
@@ -4801,12 +4856,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self.async_set_updated_data(self._build_data())
 
-        # Schedule automatic reconnection with exponential backoff — unless this
-        # coordinator has been torn down (terminal close).  Without this guard the
-        # client.disconnect() inside async_disconnect would re-arm a reconnect and
-        # the unloaded instance would keep running as a zombie.
-        if not self._closed:
-            self._schedule_reconnect()
+        # Schedule automatic reconnection with exponential backoff
+        self._schedule_reconnect()
 
     def _schedule_reconnect(self) -> None:
         """Schedule a reconnect attempt with exponential backoff.
@@ -4816,8 +4867,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         prevents multiple concurrent reconnect coroutines from racing each other
         into BlueZ's "InProgress" error state.
         """
-        if self._closed:
-            return
         if self._reconnect_task and not self._reconnect_task.done():
             self._reconnect_task.cancel()
 
@@ -4853,8 +4902,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Wait then attempt reconnection."""
         try:
             await asyncio.sleep(delay)
-            if self._closed:
-                return
             if generation != self._reconnect_generation:
                 _LOGGER.debug(
                     "Skipping stale reconnect task (gen=%d current=%d instance=%s)",

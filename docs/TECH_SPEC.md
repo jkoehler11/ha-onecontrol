@@ -265,6 +265,59 @@ Core operational timers:
 - PIN-based gateway behavior depends on host BLE capabilities
 - gateway authentication is not a single mechanism across all models; BLE SMP bond, MyRvLink TEA unlock, CAN-BLE key/seed, and CAN password unlock may appear independently depending on controller family
 
+## 10.1 Cover Control and Movement Safety
+
+Covers (awnings, slides, vent covers) are controlled as **momentary H-bridge**
+loads. On IDS-CAN BLE gateways the awning/slide device type is
+`MomentaryHBridgeType2` (33), and on legacy (non-CAN) gateways H-Bridge action
+frames are used. A momentary H-bridge is energized only while the direction
+command is actively held — exactly like the physical panel's press-and-hold
+button — so HA's discrete open/close/stop taps are translated into a repeating
+"held button" in the coordinator:
+
+- **CAN-BLE (`async_can_cover`):** an *active REMOTE_CONTROL session* is opened
+  first (the motor controller rejects COMMAND frames without one, reporting
+  `RelayMovementStatus.UnableToMoveNoSession`). The direction COMMAND is then
+  repeated every `_COVER_COMMAND_REPEAT_S` (0.2 s) by a background repeater task
+  until a STOP bumps the per-device generation counter.
+- **Non-CAN (`_hbridge_cover_repeater`):** the equivalent H-Bridge ACTION frame
+  is resent on the same held-button cadence.
+
+Direction byte mapping (HA logical → IDS-CAN `COMMAND_MODE` byte, decompiled
+from the official app's
+`LogicalDeviceRelayHBridgeMomentaryCommandType2.ToCommand`):
+
+| HA direction | COMMAND_MODE | Meaning |
+|--------------|--------------|---------|
+| 0x00 stop    | 0x00         | Stop    |
+| 0x01 open    | 0x01         | Forward / extend |
+| 0x02 close   | 0x02         | Reverse / retract |
+
+> This is the **command** enum, not the `RELAY_TYPE_2_OUTPUT_STATE` **status**
+> enum (`OFF_STOP=0, ON=1, FORWARD_EXTEND=2, REVERSE_RETRACT=3`). An earlier
+> build mapped open→0x02 / close→0x03 from the status enum, which made the
+> awning retract on "open" — confirmed live via DEVICE_STATUS: sending 0x02 for
+> open made the awning report 0xC3 (reverse/closing).
+
+### REMOTE_CONTROL session heartbeat
+
+The X180T motor controller terminates an idle REMOTE_CONTROL session with
+`RESPONSE.TIMEOUT` (`0x0F`) after ~1 s, so the session heartbeat must fire well
+under that window while a cover is moving. `_RC_SESSION_HEARTBEAT_S = 0.5` sends
+a `SESSION_HEARTBEAT` (0x44) every 500 ms. (The official app instead lets the
+session lapse and re-opens it with a fresh seed/key — `TendCoreSession` — but
+the 0x44 heartbeat path is what has been observed holding the session open here.)
+
+### Safety timeout
+
+Repeating open/close commands would run the motor indefinitely if a STOP frame
+is ever dropped (BLE drop, stuck button, session loss). Each cover repeater
+records a start timestamp and force-sends a STOP once
+`_COVER_SAFETY_TIMEOUT_S` (6.0 s) has elapsed without an explicit STOP, logging
+`CAN BLE: cover safety timeout … — sending STOP` (WARNING). Added
+(2026-09-03) after a runaway awning event. Change only `_COVER_SAFETY_TIMEOUT_S`
+to alter the limit.
+
 ## 11. Evolution Notes (Commit History)
 
 Recent trajectory includes:
