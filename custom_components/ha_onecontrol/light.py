@@ -29,17 +29,14 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import OneControlCoordinator
+from .helpers import is_valid_device_id
 from .protocol.commands import CommandBuilder
 from .protocol.events import DimmableLight, RgbLight
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def _is_valid_device_id(device_id: int) -> bool:
-    """Check if device_id is valid (not a sentinel value like 0x0000)."""
-    # Exclude invalid/placeholder device IDs
-    invalid_ids = {0x00, 0x8F, 0x59}
-    return device_id not in invalid_ids
+
 
 
 async def async_setup_entry(
@@ -56,7 +53,7 @@ async def async_setup_entry(
     @callback
     def _on_event(event: Any) -> None:
         if isinstance(event, DimmableLight):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 return
             key = f"dim_{event.table_id:02x}:{event.device_id:02x}"
             if key not in discovered:
@@ -65,7 +62,7 @@ async def async_setup_entry(
                     [OneControlDimmableLight(coordinator, address, event.table_id, event.device_id)]
                 )
         elif isinstance(event, RgbLight):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 return
             key = f"rgb_{event.table_id:02x}:{event.device_id:02x}"
             if key not in discovered:
@@ -129,7 +126,7 @@ class OneControlDimmableLight(CoordinatorEntity[OneControlCoordinator], LightEnt
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
         mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_light_{table_id:02x}_{device_id:02x}"
+        self._attr_unique_id = f"{mac}_light_{device_id:02x}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",
@@ -276,7 +273,7 @@ class OneControlRgbLight(CoordinatorEntity[OneControlCoordinator], LightEntity):
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
         mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_rgb_{table_id:02x}_{device_id:02x}"
+        self._attr_unique_id = f"{mac}_rgb_{device_id:02x}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",

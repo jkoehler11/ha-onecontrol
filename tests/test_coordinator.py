@@ -1,20 +1,4 @@
-import sys
-import types
 from types import SimpleNamespace
-
-update_coordinator = types.ModuleType("homeassistant.helpers.update_coordinator")
-
-class DataUpdateCoordinator:
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        pass
-
-    @classmethod
-    def __class_getitem__(cls, item: object) -> type:
-        return cls
-
-update_coordinator.DataUpdateCoordinator = DataUpdateCoordinator
-sys.modules["homeassistant.helpers.update_coordinator"] = update_coordinator
-sys.modules.setdefault("homeassistant.helpers", types.ModuleType("homeassistant.helpers")).update_coordinator = update_coordinator
 
 from custom_components.ha_onecontrol.coordinator import OneControlCoordinator
 from custom_components.ha_onecontrol.protocol.events import CoverStatus, RelayStatus
@@ -152,7 +136,8 @@ def test_dispatch_can_entity_processes_hbridge_type_32_cover_state() -> None:
 
 def test_dispatch_can_entity_recognizes_vent_cover_device_name() -> None:
     coordinator = object.__new__(OneControlCoordinator)
-    coordinator._can_device_types = {0x86: 10}
+    # Unrecognized device type -> cover classification comes from the name.
+    coordinator._can_device_types = {0x86: 1}
     coordinator._invalid_can_sources = set()
     coordinator.device_names = {}
     coordinator.tanks = {}

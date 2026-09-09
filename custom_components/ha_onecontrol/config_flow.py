@@ -14,12 +14,14 @@ from homeassistant.config_entries import (
     SOURCE_RECONFIGURE,
     ConfigFlow,
     ConfigFlowResult,
+    OptionsFlow,
 )
 from homeassistant.const import CONF_ADDRESS
 
 from .const import (
     CONF_ADVERTISED_GATEWAY_VERSION,
     CONF_BLUETOOTH_PIN,
+    CONF_ENABLE_COVER_CONTROL,
     CONF_GATEWAY_FAMILY,
     CONF_GATEWAY_PIN,
     CONF_PAIRING_METHOD,
@@ -165,6 +167,13 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
             ),
         )
 
+    @staticmethod
+    def async_get_options_flow(
+        config_entry: "ConfigEntry",
+    ) -> OptionsFlow:
+        """Return the options flow for this handler."""
+        return OneControlOptionsFlow(config_entry)
+
     # ------------------------------------------------------------------
     # Reconfigure an existing entry (change pairing method / PIN in place)
     # ------------------------------------------------------------------
@@ -208,21 +217,6 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Ask the user whether their gateway uses Push-to-Pair or PIN."""
-        if (
-            user_input is None
-            and self._gateway_family == GATEWAY_FAMILY_X180T
-            and self._pairing_method in (PairingMethod.UNKNOWN, PairingMethod.NONE)
-        ):
-            self._pairing_method = PairingMethod.PUSH_BUTTON
-            return await self.async_step_confirm()
-
-        if (
-            user_input is None
-            and self._gateway_family == GATEWAY_FAMILY_X180T
-            and self._pairing_method not in (PairingMethod.UNKNOWN, PairingMethod.NONE)
-        ):
-            return await self.async_step_confirm()
-
         errors: dict[str, str] = {}
         if user_input is not None:
             chosen = user_input[CONF_PAIRING_METHOD]
@@ -363,3 +357,41 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Handle the X180T confirmation step (delegates to confirm)."""
         return await self.async_step_confirm(user_input)
+
+
+class OneControlOptionsFlow(OptionsFlow):
+    """Handle options for an existing OneControl entry.
+
+    The only option today is whether to enable cover (awning/slide) motor
+    control.  It is off by default: the H-bridge motors have no limit switches
+    or supervision, so the option is gated behind a safety disclaimer.
+    """
+
+    def __init__(self, config_entry: "ConfigEntry") -> None:
+        """Initialise the options flow."""
+        self._config_entry = config_entry
+
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(
+                data={
+                    CONF_ENABLE_COVER_CONTROL: user_input[CONF_ENABLE_COVER_CONTROL],
+                }
+            )
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_ENABLE_COVER_CONTROL,
+                        default=self._config_entry.options.get(
+                            CONF_ENABLE_COVER_CONTROL, False
+                        ),
+                    ): bool,
+                }
+            ),
+        )

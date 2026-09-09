@@ -32,6 +32,7 @@ from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
+from .helpers import is_valid_device_id
 from .ble_agent import (
     PinAgentContext,
     async_get_local_adapter_macs,
@@ -89,9 +90,6 @@ from .protocol.cobs import CobsByteDecoder, cobs_encode
 from .protocol.commands import CommandBuilder
 from .protocol.ids_can_wire import (
     compose_ids_can_extended_wire_frame,
-    compose_ids_can_pid_read_request,
-    compose_ids_can_pid_read_list_request,
-    compose_ids_can_pid_write_request,
     compose_ids_can_standard_wire_frame,
     decode_ids_can_payload,
     format_ids_can_payload,
@@ -204,9 +202,7 @@ _TANK_SEED_FUNCTION_CODES: frozenset[int] = frozenset({
 _CAN_HBRIDGE_DEVICE_TYPES: frozenset[int] = frozenset({5, 6, 32, 33})
 _COVER_STATE_STATUS_BYTES: tuple[int, ...] = (0x00, 0xC0, 0xC2, 0xC3)
 # HA cover direction -> IDS-CAN RELAY_TYPE_2 output-state byte.
-# HA logical cover direction -> IDS-CAN COMMAND_MODE byte (decompiled from the
-# official app's LogicalDeviceRelayHBridgeMomentaryCommandType2.ToCommand, which
-# maps RelayHBridgeDirection Forward(2)->1, Reverse(3)->2, Stop(0)->0):
+# HA logical cover direction -> IDS-CAN COMMAND_MODE byte:
 #   open/extend  = 0x01 (FORWARD)
 #   close/retract = 0x02 (REVERSE)
 #   stop = 0x00
@@ -221,11 +217,7 @@ def _device_key(table_id: int, device_id: int) -> str:
     return f"{table_id:02x}:{device_id:02x}"
 
 
-def _is_valid_device_id(device_id: int) -> bool:
-    """Check if device_id is valid (not a sentinel value like 0x0000)."""
-    # Exclude invalid/placeholder device IDs
-    invalid_ids = {0x00, 0x8F, 0x59}
-    return device_id not in invalid_ids
+
 
 
 @dataclass
@@ -255,7 +247,6 @@ def _decode_v2_ble_can_frames(raw: bytes) -> list[bytes]:
 
     Returns an empty list when the notification is not in V2 format.
 
-    Parity: decompiled BleCommunicationsAdapter.OnDataReceived (IDS.Portable.CAN).
     """
     if not raw or raw[0] not in (0x01, 0x02, 0x03):
         return []
@@ -316,10 +307,9 @@ def _official_can_ble_gateway_version_from_part(data: bytes) -> str:
     nibbles for part number and byte 6 is the revision character.
 
     The observed Unity/X1 CAN-BLE bridge reports software part ``24955-G``
-    (descriptor: Bluetooth Gateway Daughter Board XT Assembly).  This part is
-    absent from the decompiled app's older characteristic lookup table, but it
-    behaves like the app's V1 gateway selection while still requiring explicit
-    REMOTE_CONTROL seed/key before relay COMMAND frames are accepted.
+    (descriptor: Bluetooth Gateway Daughter Board XT Assembly).  It behaves like
+    a V1 gateway selection while still requiring an explicit REMOTE_CONTROL
+    seed/key exchange before relay COMMAND frames are accepted.
     """
     if len(data) != 8:
         return "Unknown"
@@ -364,7 +354,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             CONF_GATEWAY_FAMILY, GATEWAY_FAMILY_LEGACY
         )
         self._instance_tag: str = f"{id(self):x}"[-6:]
-        # Android uses gateway_pin for both BLE bonding AND protocol auth.
+        # The gateway PIN is used for both BLE bonding and protocol auth.
         # bluetooth_pin is an optional override if the BLE PIN differs.
         # For X180T, BLE pairing is Just Works, so don't use gateway_pin as bluetooth_pin
         bluetooth_pin_default = "" if self._gateway_family == GATEWAY_FAMILY_X180T else self.gateway_pin
@@ -425,7 +415,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         # Set once the initial GetDevices command has been sent after connection.
         # Metadata requests are delayed until this is True to mirror the v2.7.2
-        # Android plugin sequencing (GetDevices T+500ms, metadata T+1500ms).
+        # plugin sequencing (GetDevices T+500ms, metadata T+1500ms).
         self._initial_get_devices_sent: bool = False
         # CRC of the metadata last successfully loaded from the gateway.
         # Persists across disconnect/reconnect so we can skip re-requests when
@@ -511,22 +501,22 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._metadata_raw: dict[str, DeviceMetadata] = {}
 
         # Last non-zero brightness per dimmable device (persists across off/on cycles).
-        # Mirrors Android lastKnownDimmableBrightness — only updated when brightness > 0.
+        # Only updated when brightness > 0 (last known brightness restore).
         self._last_known_dimmable_brightness: dict[str, int] = {}
 
         # Last known RGB color (R, G, B) per device — updated only when mode > 0 (light is on).
-        # Mirrors Android lastKnownRgbColor — never overwritten by an off-state frame (R=0,G=0,B=0).
+        # Never overwritten by an off-state frame (R=0,G=0,B=0).
         self._last_known_rgb_color: dict[str, tuple[int, int, int]] = {}
 
         # ── HVAC debounce / pending guard / retry ─────────────────────
         # Pending command guard: suppresses stale gateway echoes during command window.
-        # Mirrors Android pendingHvacCommands.
+        # Pending HVAC command guard state.
         self._pending_hvac: dict[str, PendingHvacCommand] = {}
         # Command merge baseline: kept in sync with hvac_zones but only updated
         # after the pending guard passes (so suppressed echoes don't corrupt merges).
         self._hvac_zone_states: dict[str, HvacZone] = {}
         # Observed capability bitmask learned from status events.
-        # Mirrors Android observedHvacCapability (bit0=Gas, bit1=AC, bit2=HeatPump, bit3=Fan).
+        # Observed capability bitmask (bit0=Gas, bit1=AC, bit2=HeatPump, bit3=Fan).
         self.observed_hvac_capability: dict[str, int] = {}
         # Asyncio timer handles for setpoint retry (one per zone).
         self._hvac_retry_handles: dict[str, asyncio.TimerHandle] = {}
@@ -816,8 +806,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._client, reason="pre-cover-stop", force=True
                 )
                 if not await self._ensure_remote_control_session(self._client, device_id):
-                    _LOGGER.warning(
-                        "CAN BLE: cover STOP skipped — REMOTE_CONTROL activation failed for device=0x%02X",
+                    _LOGGER.error(
+                        "CAN BLE: cover STOP DROPPED — REMOTE_CONTROL activation failed for device=0x%02X; "
+                        "the repeater is cancelled so the watchdog will de-energize the motor, but the stop "
+                        "frame was not sent",
                         device_id,
                     )
                     return
@@ -920,7 +912,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 name=f"ha_onecontrol_cover_{device_id:02x}",
             )
             self._cover_command_tasks[device_id] = task
-            _LOGGER.warning(
+            _LOGGER.info(
                 "CAN BLE: STARTED cover repeater device=0x%02X direction=0x%02X gen=%d",
                 device_id, can_direction, gen,
             )
@@ -956,7 +948,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             while True:
                 # Exit if a newer command bumped the generation
                 if self._cover_gen.get(device_id, 0) != gen:
-                    _LOGGER.warning("Cover repeater EXIT device=0x%02X gen=%d (current=%d)", device_id, gen, self._cover_gen.get(device_id, 0))
+                    _LOGGER.debug("Cover repeater EXIT device=0x%02X gen=%d (current=%d)", device_id, gen, self._cover_gen.get(device_id, 0))
                     return
                 # Safety timeout: never run the motor longer than
                 # _COVER_SAFETY_TIMEOUT_S without an explicit STOP. Prevents a
@@ -980,7 +972,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             _LOGGER.warning("CAN BLE: cover safety STOP failed: %s", exc)
                     return
                 if not (self._client and self._connected and self._can_read_subscribed):
-                    _LOGGER.warning("Cover repeater WAITING for reconnect (device=0x%02X)", device_id)
+                    _LOGGER.debug("Cover repeater WAITING for reconnect (device=0x%02X)", device_id)
                     await asyncio.sleep(0.5)
                     continue
 
@@ -999,7 +991,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     message_data=direction & 0xFF,
                     payload=b"",
                 )
-                _LOGGER.warning(
+                _LOGGER.debug(
                     "CAN BLE: cover repeater TX device=0x%02X direction=%s",
                     device_id,
                     direction_name,
@@ -1083,7 +1075,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         ``direction`` — 0x00=Stop, 0x01=Open/Extend, 0x02=Close/Retract
         """
-        _LOGGER.warning("COVER async_cover device=0x%02X dir=0x%02X connected=%s", device_id, direction, self._connected)
+        _LOGGER.debug("COVER async_cover device=0x%02X dir=0x%02X connected=%s", device_id, direction, self._connected)
         if self._is_can_ble:
             await self.async_can_cover(device_id, direction)
             return
@@ -1119,90 +1111,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._cover_command_tasks[device_id] = task
             _LOGGER.info("H-Bridge: started repeating cover %s for device=0x%02X", "OPEN" if direction & 0xFF == 0x01 else "CLOSE", device_id)
             return
-
-    async def async_cover_advanced(
-        self, table_id: int, device_id: int, direction: int
-    ) -> None:
-        """Send a single-fire cover command (no repeating).
-
-        Used for advanced H-Bridge commands that do not require held-button
-        behaviour: Clear Latch (0x03/0x83), Home Reset (0x04/0x84),
-        Auto Open (0x05/0x85), Auto Close (0x06/0x86).
-
-        The command is sent exactly once — the gateway handles the full
-        sequence internally (e.g. a full auto-retract cycle).
-        """
-        # Cancel any in-progress repeater task first so we don't
-        # interfere with an active open/close operation.
-        self._cancel_cover_task(device_id)
-
-        direction_byte = direction & 0xFF
-
-        if self._is_can_ble:
-            if self._client and self._connected and self._can_read_subscribed:
-                frame = compose_ids_can_extended_wire_frame(
-                    message_type=0x82,
-                    source_address=self._gateway_can_address,
-                    target_address=device_id,
-                    message_data=direction_byte,
-                    payload=b"",
-                )
-                dir_names = {
-                    self._cmd.HBRIDGE_CLEAR_LATCH_CMD: "CLEAR_LATCH",
-                    self._cmd.HBRIDGE_HOME_RESET_CMD: "HOME_RESET",
-                    self._cmd.HBRIDGE_AUTO_OPEN_CMD: "AUTO_OPEN",
-                    self._cmd.HBRIDGE_AUTO_CLOSE_CMD: "AUTO_CLOSE",
-                }
-                dir_name = dir_names.get(direction_byte, f"0x{direction_byte:02X}")
-                _LOGGER.info(
-                    "CAN BLE: advanced cover command device=0x%02X direction=%s frame=%s",
-                    device_id,
-                    dir_name,
-                    frame.hex(),
-                )
-                try:
-                    await self._write_can_frame(self._client, frame, label=f"cover advanced {dir_name}")
-                except BleakError as exc:
-                    _LOGGER.warning("CAN BLE: advanced cover command failed: %s", exc)
-            else:
-                frame = compose_ids_can_extended_wire_frame(
-                    message_type=0x82,
-                    source_address=self._gateway_can_address,
-                    target_address=device_id,
-                    message_data=direction_byte,
-                    payload=b"",
-                )
-                _LOGGER.info(
-                    "CAN BLE: gateway disconnected — queuing advanced cover command device=0x%02X direction=0x%02X",
-                    device_id,
-                    direction_byte,
-                )
-                self._can_commands_queue.append((frame, time.monotonic(), device_id))
-                self._cancel_reconnect()
-                self.hass.async_create_task(self.async_connect())
-            return
-
-        # MyRvLink H-Bridge path: send a single command.
-        cmd = self._cmd.build_action_hbridge(table_id, device_id, direction_byte)
-        dir_names = {
-            self._cmd.HBRIDGE_CLEAR_LATCH_CMD: "CLEAR_LATCH",
-            self._cmd.HBRIDGE_HOME_RESET_CMD: "HOME_RESET",
-            self._cmd.HBRIDGE_AUTO_OPEN_CMD: "AUTO_OPEN",
-            self._cmd.HBRIDGE_AUTO_CLOSE_CMD: "AUTO_CLOSE",
-        }
-        dir_name = dir_names.get(direction_byte, f"0x{direction_byte:02X}")
-        _LOGGER.info(
-            "H-Bridge advanced command table=%d device=0x%02X direction=%s cmd=%s",
-            table_id,
-            device_id,
-            dir_name,
-            cmd.hex(),
-        )
-        try:
-            await self.async_send_command(cmd)
-        except Exception as exc:
-            _LOGGER.warning("H-Bridge advanced command failed: %s", exc)
-
 
     async def async_set_dimmable(
         self, table_id: int, device_id: int, brightness: int
@@ -1431,7 +1339,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _update_observed_hvac_capability(self, zone_key: str, zone: HvacZone) -> None:
         """Accumulate observed HVAC capability from status events.
 
-        Mirrors Android observedHvacCapability logic — each status event can
+        Accumulates observed capability — each status event can
         reveal new capabilities even if GetDevicesMetadata returns 0x00.
         """
         prev = self.observed_hvac_capability.get(zone_key, 0)
@@ -1443,7 +1351,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         elif active_status == 3:
             cap |= HVAC_CAP_HEAT_PUMP | HVAC_CAP_AC
         elif active_status == 4:
-            cap |= HVAC_CAP_ELECTRIC_HEAT  # Electric heat (APK IsElectricHeat)
+            cap |= HVAC_CAP_ELECTRIC_HEAT  # Electric heat (distinct from gas)
         elif active_status in (5, 6):
             cap |= HVAC_CAP_GAS
 
@@ -1470,7 +1378,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Always updates observed capability and triggers metadata request.
         Only updates state dicts if the event is not suppressed by the guard.
-        Mirrors Android handleHvacStatus() pending-guard logic.
+        Suppresses stale status echoes during the pending-command window.
         """
         key = _device_key(zone.table_id, zone.device_id)
         self._ensure_metadata_for_table(zone.table_id)
@@ -1510,7 +1418,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 # Window expired — clear stale pending
                 self._pending_hvac.pop(key, None)
 
-        if _is_valid_device_id(zone.device_id):
+        if is_valid_device_id(zone.device_id):
             self.hvac_zones[key] = zone
             self._hvac_zone_states[key] = zone
         else:
@@ -1519,7 +1427,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _schedule_setpoint_retry(self, zone_key: str) -> None:
         """Schedule a setpoint verification/retry check after HVAC_SETPOINT_RETRY_DELAY_S.
 
-        Mirrors Android scheduleSetpointVerification() — WRITE_TYPE_NO_RESPONSE
+        WRITE_TYPE_NO_RESPONSE writes
         can be silently dropped by the BLE stack; this ensures eventual delivery.
         """
         if zone_key in self._hvac_retry_handles:
@@ -1536,7 +1444,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Re-send an unconfirmed HVAC setpoint command.
 
         Uses exact values from PendingHvacCommand — no re-merging.
-        Mirrors Android retryHvacSetpoint().
+        Retries the setpoint write with the exact prior values.
         """
         pending = self._pending_hvac.get(zone_key)
         if pending is None or not pending.is_setpoint_change:
@@ -1573,13 +1481,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         cmd = self._cmd.build_action_generator(table_id, device_id, run)
         await self.async_send_command(cmd)
 
-    async def async_set_generator_prime(
-        self, table_id: int, device_id: int,
-    ) -> None:
-        """Send a generator prime (fuel pump) command."""
-        cmd = self._cmd.build_action_generator_prime(table_id, device_id)
-        await self.async_send_command(cmd)
-
     async def async_set_rgb(
         self,
         table_id: int,
@@ -1600,76 +1501,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         await self.async_send_command(cmd)
 
-    # ------------------------------------------------------------------
-    # PID Read/Write (IDS-CAN gateways only)
-    # ------------------------------------------------------------------
-
-    async def async_read_pid(
-        self, pid_key: str, table_id: int, device_id: int,
-    ) -> float | None:
-        """Read a generator PID value via IDS-CAN PID_READ_WRITE request.
-
-        Sends a PID_READ_WRITE (0x11) REQUEST frame via CAN_WRITE.
-        Response arrives asynchronously via the RESPONSE handler.
-        For now, returns the cached value; full async response handling
-        requires a future-based correlation mechanism (future work).
-        """
-        if not self.is_can_ble_gateway or not self._can_read_subscribed:
-            _LOGGER.debug("PID read skipped: not a CAN-BLE gateway")
-            return None
-
-        _LOGGER.debug("PID read requested: %s", pid_key)
-        # TODO: Implement future-based PID response correlation
-        # For now, rely on cached values from event stream
-        return None
-
-    async def async_write_pid(
-        self,
-        pid_key: str,
-        table_id: int,
-        device_id: int,
-        value: float,
-        raw_bytes: bytes,
-    ) -> None:
-        """Write a generator PID value via IDS-CAN PID_READ_WRITE request.
-
-        Composes a PID_READ_WRITE (0x11) REQUEST frame with the write
-        operation flag and sends it via CAN_WRITE characteristic.
-
-        Only supported on IDS-CAN BLE gateways. MyRvLink gateways
-        use an alternative PID path (not yet implemented).
-        """
-        if not self.is_can_ble_gateway:
-            _LOGGER.warning(
-                "PID write not supported for MyRvLink gateway: %s", pid_key
-            )
-            return
-
-        if not self._client or not self._connected:
-            _LOGGER.warning("Cannot write PID: not connected")
-            return
-
-        # Use gateway CAN address as source; target is the device's CAN address
-        source = self._gateway_can_address & 0xFF if self._gateway_can_address else 0xFF
-        target = device_id & 0xFF
-
-        frame = compose_ids_can_pid_write_request(
-            source_address=source,
-            target_address=target,
-            pid_id=0,  # PID ID resolution TBD — uses PID name for now
-            value_bytes=raw_bytes,
-        )
-
-        # Encode into BLE V2 TwentyNineBit format and write
-        encoded = self._encode_ble_v2_twenty_nine_bit(frame)
-        _LOGGER.debug(
-            "PID write: %s=%s frame=%s",
-            pid_key, value, frame.hex(),
-        )
-        await self._client.write_gatt_char(
-            CAN_WRITE_CHAR_UUID, encoded, response=False
-        )
-
     async def async_clear_lockout(self) -> None:
         """Send lockout clear sequence (0x55 arm → 100ms → 0xAA clear).
 
@@ -1677,7 +1508,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Fallback: COBS-encoded via DATA_WRITE.
         Throttled to one attempt per 5 seconds.
 
-        Reference: Android requestLockoutClear() — MyRvLinkBleManager.kt
+        Reference: INTERNALS.md § In-Motion Lockout
         """
         if self._can_ble_confirmed:
             _LOGGER.warning(
@@ -3036,7 +2867,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raw_level = payload[0] if len(payload) >= 1 else 0x00
             level_pct = max(0, min(100, raw_level))
             event = TankLevel(table_id=0, device_id=src, level=level_pct)
-            if _is_valid_device_id(src):
+            if is_valid_device_id(src):
                 self.tanks[key] = event
                 _LOGGER.debug(
                     "CAN BLE: stored tank %s level=%d%% name=%s payload=%s",
@@ -3054,7 +2885,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if pos == 0xFF:
                 pos = None
             event = CoverStatus(table_id=0, device_id=src, status=status, position=pos)
-            if _is_valid_device_id(src):
+            if is_valid_device_id(src):
                 prev = self.covers.get(key)
                 self.covers[key] = event
                 if prev is None or prev.status != status:
@@ -3073,7 +2904,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             event = RelayStatus(
                 table_id=0, device_id=src, is_on=is_on, status_byte=status_byte
             )
-            if _is_valid_device_id(src):
+            if is_valid_device_id(src):
                 self.relays[key] = event
 
         if event is not None:
@@ -3537,7 +3368,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> bool:
         """Open a REMOTE_CONTROL IDS-CAN session with *device_id* if not yet open.
 
-        Protocol (from decompiled SessionClient.cs):
+        Protocol:
           1. Send REQUEST(0x80) msg_data=0x42 payload=[0x00, 0x04] → seed request
           2. Receive RESPONSE(0x81) msg_data=0x42 payload=[sid×2, seed×4]
           3. Encrypt seed with TEA(REMOTE_CONTROL cypher from SESSION_ID descriptors)
@@ -4098,7 +3929,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Implements the observed-table path: any status event carrying a table_id
         triggers a metadata request for that table if we haven't already loaded or
-        requested it.  This mirrors Android's ensureMetadataRequestedForTable().
+        requested it.
         """
         if table_id == 0:
             return
@@ -4500,7 +4331,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
         elif isinstance(event, RelayStatus):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 _LOGGER.debug("Skipping RelayStatus with invalid device_id=0x%02x", event.device_id)
                 return
             key = _device_key(event.table_id, event.device_id)
@@ -4537,7 +4368,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
 
         elif isinstance(event, DimmableLight):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 _LOGGER.debug("Skipping DimmableLight with invalid device_id=0x%02x", event.device_id)
             else:
                 key = _device_key(event.table_id, event.device_id)
@@ -4547,18 +4378,18 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, RgbLight):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 _LOGGER.debug("Skipping RgbLight with invalid device_id=0x%02x", event.device_id)
             else:
                 key = _device_key(event.table_id, event.device_id)
                 self.rgb_lights[key] = event
-                # Only persist non-zero color — mirrors Android lastKnownRgbColor update guard.
+                # Only persist non-zero color.
                 if event.is_on:
                     self._last_known_rgb_color[key] = (event.red, event.green, event.blue)
                 self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, CoverStatus):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 _LOGGER.debug("Skipping CoverStatus with invalid device_id=0x%02x", event.device_id)
             else:
                 key = _device_key(event.table_id, event.device_id)
@@ -4571,7 +4402,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if isinstance(item, HvacZone):
                     self._handle_hvac_zone(item)
                 elif isinstance(item, TankLevel):
-                    if _is_valid_device_id(item.device_id):
+                    if is_valid_device_id(item.device_id):
                         key = _device_key(item.table_id, item.device_id)
                         self.tanks[key] = item
                         _LOGGER.info("Stored tank %s: level=%d%%", key, item.level)
@@ -4582,7 +4413,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self._process_metadata(item)
 
         elif isinstance(event, TankLevel):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 _LOGGER.debug("Skipping TankLevel with invalid device_id=0x%02x", event.device_id)
             else:
                 key = _device_key(event.table_id, event.device_id)
@@ -4591,13 +4422,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, HvacZone):
-            if _is_valid_device_id(event.device_id):
+            if is_valid_device_id(event.device_id):
                 self._handle_hvac_zone(event)
             else:
                 _LOGGER.debug("Skipping HvacZone with invalid device_id=0x%02x", event.device_id)
 
         elif isinstance(event, DeviceOnline):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 _LOGGER.debug("Skipping DeviceOnline with invalid device_id=0x%02x", event.device_id)
             else:
                 key = _device_key(event.table_id, event.device_id)
@@ -4612,7 +4443,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
         elif isinstance(event, DeviceLock):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 _LOGGER.debug("Skipping DeviceLock with invalid device_id=0x%02x", event.device_id)
             else:
                 key = _device_key(event.table_id, event.device_id)
@@ -4620,7 +4451,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, GeneratorStatus):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 _LOGGER.debug("Skipping GeneratorStatus with invalid device_id=0x%02x", event.device_id)
             else:
                 key = _device_key(event.table_id, event.device_id)
@@ -4628,7 +4459,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, HourMeter):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 _LOGGER.debug("Skipping HourMeter with invalid device_id=0x%02x", event.device_id)
             else:
                 key = _device_key(event.table_id, event.device_id)
@@ -4636,7 +4467,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, LevelerStatus):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 _LOGGER.debug("Skipping LevelerStatus with invalid device_id=0x%02x", event.device_id)
             else:
                 key = _device_key(event.table_id, event.device_id)
@@ -4644,7 +4475,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._ensure_metadata_for_table(event.table_id)
 
         elif isinstance(event, TankAlert):
-            if not _is_valid_device_id(event.device_id):
+            if not is_valid_device_id(event.device_id):
                 _LOGGER.debug("Skipping TankAlert with invalid device_id=0x%02x", event.device_id)
             else:
                 key = _device_key(event.table_id, event.device_id)
@@ -4714,7 +4545,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if meta.function_name not in _RELAY_SEED_FUNCTION_CODES:
                 continue
             # Skip invalid device IDs
-            if not _is_valid_device_id(meta.device_id):
+            if not is_valid_device_id(meta.device_id):
                 _LOGGER.debug("Skipping relay seed for invalid device_id=0x%02x", meta.device_id)
                 continue
             # Already discovered via a live relay event — skip.
@@ -4753,7 +4584,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if meta.function_name not in _TANK_SEED_FUNCTION_CODES:
                 continue
             # Skip invalid device IDs
-            if not _is_valid_device_id(meta.device_id):
+            if not is_valid_device_id(meta.device_id):
                 _LOGGER.debug("Skipping tank seed for invalid device_id=0x%02x", meta.device_id)
                 continue
             # Already discovered via a live tank event — skip.

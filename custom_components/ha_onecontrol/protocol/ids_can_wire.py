@@ -1,7 +1,7 @@
 """IDS-CAN wire-frame parsing helpers.
 
 These helpers decode the raw CAN adapter frame format seen on IDS-CAN TCP
-bridges (per decompiled ``CanAdapter.OnPhysicalNetworkReceived``).
+bridges.
 
 Frame layout:
 - Byte 0: payload length (DLC, 0..8)
@@ -58,12 +58,12 @@ class IdsCanDecodedPayload:
 
 
 def ids_can_message_type_name(message_type: int) -> str:
-    """Return IDS-CAN message type name from decompiled enum values."""
+    """Return IDS-CAN message type name."""
     return _IDS_CAN_MESSAGE_TYPE_NAMES.get(message_type & 0xFF, "UNKNOWN")
 
 
 def ids_can_request_name(request_code: int) -> str:
-    """Return IDS-CAN REQUEST code name from decompiled REQUEST constants."""
+    """Return IDS-CAN REQUEST code name."""
     return {
         0x00: "PART_NUMBER_READ",
         0x01: "MUTE_DEVICE",
@@ -99,7 +99,7 @@ def ids_can_request_name(request_code: int) -> str:
 
 
 def ids_can_response_name(response_code: int) -> str:
-    """Return IDS-CAN RESPONSE enum name from decompiled RESPONSE values."""
+    """Return IDS-CAN RESPONSE enum name."""
     return {
         0x00: "SUCCESS",
         0x01: "REQUEST_NOT_SUPPORTED",
@@ -128,12 +128,12 @@ def ids_can_response_name(response_code: int) -> str:
 
 
 def decode_ids_can_payload(wire: IdsCanWireFrame) -> IdsCanDecodedPayload | None:
-    """Decode known IDS-CAN message payload formats with decompiled parity."""
+    """Decode known IDS-CAN message payload formats."""
     message_type = wire.message_type & 0xFF
     payload = wire.payload
 
     if message_type == 0x00 and len(payload) == 8:
-        # C# parity: MAC is bytes [2:8], protocol version is byte [1], and
+        # NETWORK frame layout: MAC is bytes [2:8], protocol version is byte [1], and
         # NETWORK_STATUS bitfields are interpreted from byte [0].
         status = payload[0] & 0xFF
         return IdsCanDecodedPayload(
@@ -335,7 +335,7 @@ def compose_ids_can_extended_wire_frame(
     dst = target_address & 0xFF
     mdata = message_data & 0xFF
 
-    # 29-bit CAN id packing (decompiled parity):
+    # 29-bit CAN id packing:
     #   message_type = 0x80 | ((can_id >> 24) & 0x1C) | ((can_id >> 16) & 0x03)
     # Inverse of parse_ids_can_wire_frame for extended IDs:
     # parse does: message_type = 0x80 | ((can_id >> 24) & 0x1C) | ((can_id >> 16) & 0x03)
@@ -345,102 +345,6 @@ def compose_ids_can_extended_wire_frame(
     can_id = ((mtype5 & 0x1C) << 24) | (src << 18) | ((mtype5 & 0x03) << 16) | (dst << 8) | mdata
     id_word = 0x80000000 | (can_id & 0x7FFFFFFF)
     return bytes([dlc]) + id_word.to_bytes(4, "big") + payload
-
-
-# ------------------------------------------------------------------
-# IDS-CAN PID Read/Write helpers
-# ------------------------------------------------------------------
-# These compose REQUEST (0x80) frames for PID_READ_LIST (0x10),
-# PID_READ_WRITE (0x11), and GET_PID_PROPERTIES (0x12) operations.
-#
-# Reference: Android OneControl app MyRvLinkCommandGetDevicePid /
-# MyRvLinkCommandSetDevicePid, and IDS-CAN REQUEST frame definitions
-# from IDS.Core.IDS_CAN.
-
-
-def compose_ids_can_pid_read_request(
-    source_address: int,
-    target_address: int,
-    pid_id: int,
-) -> bytes:
-    """Compose a PID_READ_WRITE (0x11) request frame to read a single PID.
-
-    Returns raw wire frame bytes ready for CAN_WRITE characteristic.
-    PID_READ_WRITE request: payload = [pid_hi][pid_lo][0x00=read]
-    """
-    return compose_ids_can_extended_wire_frame(
-        message_type=0x80,  # REQUEST
-        source_address=source_address,
-        target_address=target_address,
-        message_data=0x11,  # PID_READ_WRITE
-        payload=bytes([
-            (pid_id >> 8) & 0xFF,
-            pid_id & 0xFF,
-            0x00,  # read operation
-        ]),
-    )
-
-
-def compose_ids_can_pid_write_request(
-    source_address: int,
-    target_address: int,
-    pid_id: int,
-    value_bytes: bytes,
-) -> bytes:
-    """Compose a PID_READ_WRITE (0x11) request frame to write a PID value.
-
-    PID_READ_WRITE request: payload = [pid_hi][pid_lo][0x01=write][value...]
-    Value length is determined by the PID definition (typically 1-4 bytes).
-    """
-    payload = bytes([
-        (pid_id >> 8) & 0xFF,
-        pid_id & 0xFF,
-        0x01,  # write operation
-    ]) + value_bytes
-    return compose_ids_can_extended_wire_frame(
-        message_type=0x80,  # REQUEST
-        source_address=source_address,
-        target_address=target_address,
-        message_data=0x11,  # PID_READ_WRITE
-        payload=payload,
-    )
-
-
-def compose_ids_can_pid_read_list_request(
-    source_address: int,
-    target_address: int,
-    pid_ids: list[int],
-) -> bytes:
-    """Compose a PID_READ_LIST (0x10) request to read multiple PIDs at once.
-
-    PID_READ_LIST request: payload = [count][pid1_hi][pid1_lo][pid2_hi][pid2_lo]...
-    Max 3 PIDs per frame (8-byte payload limit: 1 count + 3*2 = 7 bytes).
-    """
-    count = min(len(pid_ids), 3)
-    payload = bytes([count & 0xFF])
-    for pid in pid_ids[:count]:
-        payload += bytes([(pid >> 8) & 0xFF, pid & 0xFF])
-    return compose_ids_can_extended_wire_frame(
-        message_type=0x80,  # REQUEST
-        source_address=source_address,
-        target_address=target_address,
-        message_data=0x10,  # PID_READ_LIST
-        payload=payload,
-    )
-
-
-def compose_ids_can_panic_stop_request(
-    source_address: int,
-    target_address: int,
-) -> bytes:
-    """Compose a panic stop request (emergency generator stop)."""
-    return compose_ids_can_extended_wire_frame(
-        message_type=0x80,  # REQUEST
-        source_address=source_address,
-        target_address=target_address,
-        message_data=0x11,  # PID_READ_WRITE
-        payload=bytes([0x00, 0x00, 0x01, 0x02]),  # emergency stop
-    )
 
 
 def compose_ids_can_standard_wire_frame(

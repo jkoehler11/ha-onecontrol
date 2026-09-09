@@ -27,11 +27,7 @@ from homeassistant.components.sensor import (
 )
 
 
-def _is_valid_device_id(device_id: int) -> bool:
-    """Check if device_id is valid (not a sentinel value like 0x0000)."""
-    # Exclude invalid/placeholder device IDs
-    invalid_ids = {0x00, 0x8F, 0x59}
-    return device_id not in invalid_ids
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     CONF_ADDRESS,
@@ -47,6 +43,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import OneControlCoordinator
+from .helpers import is_valid_device_id
 from .protocol.events import CoverStatus, GeneratorStatus, HourMeter, LevelerStatus, TankAlert, TankLevel
 
 _LOGGER = logging.getLogger(__name__)
@@ -87,7 +84,7 @@ async def async_setup_entry(
         items = event if isinstance(event, list) else [event]
         for item in items:
             if isinstance(item, TankLevel):
-                if not _is_valid_device_id(item.device_id):
+                if not is_valid_device_id(item.device_id):
                     continue
                 key = f"{item.table_id:02x}:{item.device_id:02x}"
                 if key not in discovered_tanks:
@@ -96,7 +93,7 @@ async def async_setup_entry(
                     new.append(OneControlTankSensor(coordinator, address, item.table_id, item.device_id))
 
             elif isinstance(item, GeneratorStatus):
-                if not _is_valid_device_id(item.device_id):
+                if not is_valid_device_id(item.device_id):
                     continue
                 key = f"{item.table_id:02x}:{item.device_id:02x}"
                 if key not in discovered_generators:
@@ -108,7 +105,7 @@ async def async_setup_entry(
                     ])
 
             elif isinstance(item, HourMeter):
-                if not _is_valid_device_id(item.device_id):
+                if not is_valid_device_id(item.device_id):
                     continue
                 key = f"{item.table_id:02x}:{item.device_id:02x}"
                 if key not in discovered_hour_meters:
@@ -116,7 +113,7 @@ async def async_setup_entry(
                     new.append(OneControlHourMeterSensor(coordinator, address, item.table_id, item.device_id))
 
             elif isinstance(item, CoverStatus):
-                if not _is_valid_device_id(item.device_id):
+                if not is_valid_device_id(item.device_id):
                     continue
                 key = f"{item.table_id:02x}:{item.device_id:02x}"
                 if key not in discovered_covers:
@@ -124,7 +121,7 @@ async def async_setup_entry(
                     new.append(OneControlCoverStateSensor(coordinator, address, item.table_id, item.device_id))
 
             elif isinstance(item, LevelerStatus):
-                if not _is_valid_device_id(item.device_id):
+                if not is_valid_device_id(item.device_id):
                     continue
                 key = f"{item.table_id:02x}:{item.device_id:02x}"
                 if key not in discovered_levelers:
@@ -132,7 +129,7 @@ async def async_setup_entry(
                     new.append(OneControlLevelerPositionSensor(coordinator, address, item.table_id, item.device_id))
 
             elif isinstance(item, TankAlert):
-                if not _is_valid_device_id(item.device_id):
+                if not is_valid_device_id(item.device_id):
                     continue
                 key = f"{item.table_id:02x}:{item.device_id:02x}"
                 if key not in discovered_tank_alerts:
@@ -382,7 +379,7 @@ class OneControlTankSensor(_OneControlSensorBase):
         self._table_id = table_id
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
-        self._attr_unique_id = f"{self._mac}_tank_{table_id:02x}_{device_id:02x}"
+        self._attr_unique_id = f"{self._mac}_tank_{device_id:02x}"
         self._unsub = coordinator.register_event_callback(self._on_event)
 
     @property

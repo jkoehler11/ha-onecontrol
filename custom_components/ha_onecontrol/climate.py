@@ -42,16 +42,13 @@ from .const import (
     HVAC_SETPOINT_DEBOUNCE_S,
 )
 from .coordinator import OneControlCoordinator
+from .helpers import is_valid_device_id
 from .protocol.events import HvacZone
 
 _LOGGER = logging.getLogger(__name__)
 
 
-def _is_valid_device_id(device_id: int) -> bool:
-    """Check if device_id is valid (not a sentinel value like 0x0000)."""
-    # Exclude invalid/placeholder device IDs
-    invalid_ids = {0x00, 0x8F, 0x59}
-    return device_id not in invalid_ids
+
 
 # Map OneControl heat_mode → HA HVACMode
 _OC_TO_HA_MODE = {
@@ -86,7 +83,7 @@ async def async_setup_entry(
         items = event if isinstance(event, list) else [event]
         for item in items:
             if isinstance(item, HvacZone):
-                if not _is_valid_device_id(item.device_id):
+                if not is_valid_device_id(item.device_id):
                     continue
                 key = f"{item.table_id:02x}:{item.device_id:02x}"
                 if key not in discovered:
@@ -127,7 +124,7 @@ class OneControlClimate(CoordinatorEntity[OneControlCoordinator], ClimateEntity)
         self._device_id = device_id
         self._key = f"{table_id:02x}:{device_id:02x}"
         mac = address.replace(":", "").lower()
-        self._attr_unique_id = f"{mac}_climate_{table_id:02x}_{device_id:02x}"
+        self._attr_unique_id = f"{mac}_climate_{device_id:02x}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             name=f"OneControl {address}",

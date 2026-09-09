@@ -31,7 +31,7 @@ LIPPERT_MANUFACTURER_ID_ALT = 0x05C7   # 1479 decimal — LCI X4T2 / PIN-based g
 GATEWAY_NAME_PREFIX = "LCIRemote"      # All known gateway models advertise this name prefix
 
 # Official IDS-CAN product and device identifiers
-X180T_PRODUCT_ID = 163  # MULTIFUNCTION_UNITY_X180T_ASSEMBLY (kept for reference from APK descriptors)
+X180T_PRODUCT_ID = 163  # MULTIFUNCTION_UNITY_X180T_ASSEMBLY
 ONECONTROL_ANDROID_MOBILE_APP_PRODUCT_ID = 46
 ANDROID_MOBILE_DEVICE_TYPE = 22
 
@@ -98,59 +98,11 @@ CMD_ACTION_RGB = 0x44
 CMD_ACTION_HVAC = 0x45
 CMD_ACTION_GENERATOR_PRIME = 0x46  # GeneratorGenie prime (fuel pump prime before start)
 
-# ---------------------------------------------------------------------------
-# Generator PID addresses (IDS-CAN parameter identifiers)
-# Source: IDS.Core.IDS_CAN.Descriptors (4.6.4.0) from Android APK
-# ---------------------------------------------------------------------------
-# These PIDs are read/written via IDS-CAN REQUEST PID_READ_WRITE (0x11) frames.
-# For MyRvLink gateways, PID access uses GetDevicePid / SetDevicePid commands
-# (not yet implemented -- requires further protocol reverse-engineering).
-
-# Generator configuration PIDs (canonical IDs TBD -- these are placeholder
-# identifiers extracted from the APK descriptor names; actual IDS-CAN PID
-# addresses will be discovered via PID_READ_LIST once implemented)
-GEN_PID_AUTO_START_LOW_VOLTAGE = "GENERATOR_AUTO_START_LOW_VOLTAGE"
-GEN_PID_AUTO_START_LOW_VOLTAGE_ENABLED = "GENERATOR_AUTO_START_LOW_VOLTAGE_ENABLED"
-GEN_PID_AUTO_START_HI_TEMP_C = "GENERATOR_AUTO_START_HI_TEMP_C"
-GEN_PID_QUIET_HOURS_ENABLED = "GENERATOR_QUIET_HOURS_ENABLED"
-GEN_PID_QUIET_HOURS_START_TIME = "GENERATOR_QUIET_HOURS_START_TIME"
-GEN_PID_QUIET_HOURS_END_TIME = "GENERATOR_QUIET_HOURS_END_TIME"
-GEN_PID_AUTO_RUN_DURATION_MINUTES = "GENERATOR_AUTO_RUN_DURATION_MINUTES"
-GEN_PID_AUTO_RUN_MIN_OFF_TIME_MINUTES = "GENERATOR_AUTO_RUN_MIN_OFF_TIME_MINUTES"
-GEN_PID_GENERATOR_TYPE = "GENERATOR_TYPE"
-GEN_PID_CUMMINS_ONAN_FAULT_CODE = "CUMMINS_ONAN_GENERATOR_FAULT_CODE"
-GEN_PID_FUEL_TANK = "GENERATOR_FUEL_TANK"
-
-# Human-readable labels for generator PIDs (used in number entity names)
-GEN_PID_LABELS = {
-    GEN_PID_AUTO_START_LOW_VOLTAGE: "Auto Start Low Voltage",
-    GEN_PID_AUTO_START_LOW_VOLTAGE_ENABLED: "Auto Start Low Voltage Enabled",
-    GEN_PID_AUTO_START_HI_TEMP_C: "Auto Start High Temp",
-    GEN_PID_QUIET_HOURS_ENABLED: "Quiet Hours Enabled",
-    GEN_PID_QUIET_HOURS_START_TIME: "Quiet Hours Start Time",
-    GEN_PID_QUIET_HOURS_END_TIME: "Quiet Hours End Time",
-    GEN_PID_AUTO_RUN_DURATION_MINUTES: "Auto Run Duration",
-    GEN_PID_AUTO_RUN_MIN_OFF_TIME_MINUTES: "Auto Run Min Off Time",
-}
-
-# Generator PID units (for HA number entities)
-GEN_PID_UNITS = {
-    GEN_PID_AUTO_START_LOW_VOLTAGE: "V",
-    GEN_PID_AUTO_START_HI_TEMP_C: "°C",
-    GEN_PID_QUIET_HOURS_START_TIME: "min",
-    GEN_PID_QUIET_HOURS_END_TIME: "min",
-    GEN_PID_AUTO_RUN_DURATION_MINUTES: "min",
-    GEN_PID_AUTO_RUN_MIN_OFF_TIME_MINUTES: "min",
-}
-
-# ---------------------------------------------------------------------------
-# HVAC mode constants (from INTERNALS.md § HVAC Command)
-# ---------------------------------------------------------------------------
 HVAC_MODE_OFF = 0
 HVAC_MODE_HEAT = 1
 HVAC_MODE_COOL = 2
 HVAC_MODE_HEAT_COOL = 3
-HVAC_MODE_SCHEDULE = 4  # Programmed schedule mode (APK parity)
+HVAC_MODE_SCHEDULE = 4  # Programmed schedule mode
 
 HVAC_FAN_AUTO = 0
 HVAC_FAN_HIGH = 1
@@ -174,7 +126,7 @@ HVAC_CAP_GAS = 0x01
 HVAC_CAP_AC = 0x02
 HVAC_CAP_HEAT_PUMP = 0x04
 HVAC_CAP_MULTISPEED_FAN = 0x08
-HVAC_CAP_ELECTRIC_HEAT = 0x10  # Electric heat (distinct from gas per APK IsElectricHeat)
+HVAC_CAP_ELECTRIC_HEAT = 0x10  # Electric heat (distinct from gas)
 
 # Heat source preset names (match Android / HA climate preset_mode)
 HVAC_PRESET_GAS = "Prefer Gas"
@@ -201,6 +153,7 @@ CONF_PAIRING_METHOD = "pairing_method"
 CONF_BONDED_SOURCE = "bonded_source"
 CONF_GATEWAY_FAMILY = "gateway_family"
 CONF_ADVERTISED_GATEWAY_VERSION = "advertised_gateway_version"
+CONF_ENABLE_COVER_CONTROL = "enable_cover_control"
 
 GATEWAY_FAMILY_LEGACY = "legacy"
 GATEWAY_FAMILY_X180T = "x180t_can_ble"

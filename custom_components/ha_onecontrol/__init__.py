@@ -11,6 +11,7 @@ from homeassistant.helpers import entity_registry as er
 
 from .const import (
     CONF_BLUETOOTH_PIN,
+    CONF_ENABLE_COVER_CONTROL,
     CONF_GATEWAY_FAMILY,
     CONF_PAIRING_METHOD,
     GATEWAY_FAMILY_X180T,
@@ -24,12 +25,23 @@ PLATFORMS: list[str] = [
     "binary_sensor",
     "button",
     "climate",
-    "cover",
     "light",
-    "number",
     "sensor",
     "switch",
 ]
+
+# Cover (motor control) is opt-in: awnings/slides use H-bridge motors with no
+# limit switches or supervision, so exposing open/close is disabled by default
+# and enabled only through the options flow after the user accepts a disclaimer.
+_OPTIONAL_PLATFORMS: tuple[str, ...] = ("cover",)
+
+
+def _enabled_platforms(entry: ConfigEntry) -> list[str]:
+    """Return the platforms to forward for *entry*, honouring cover opt-in."""
+    platforms = list(PLATFORMS)
+    if entry.options.get(CONF_ENABLE_COVER_CONTROL):
+        platforms.extend(_OPTIONAL_PLATFORMS)
+    return platforms
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -174,13 +186,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "ha_onecontrol_initial_connect",
     )
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    await hass.config_entries.async_forward_entry_setups(entry, _enabled_platforms(entry))
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, _enabled_platforms(entry))
 
     if unload_ok:
         coordinator: OneControlCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
