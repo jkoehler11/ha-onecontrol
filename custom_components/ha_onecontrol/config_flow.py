@@ -172,7 +172,7 @@ class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
         config_entry: "ConfigEntry",
     ) -> OptionsFlow:
         """Return the options flow for this handler."""
-        return OneControlOptionsFlow(config_entry)
+        return OneControlOptionsFlow()
 
     # ------------------------------------------------------------------
     # Reconfigure an existing entry (change pairing method / PIN in place)
@@ -367,10 +367,6 @@ class OneControlOptionsFlow(OptionsFlow):
     or supervision, so the option is gated behind a safety disclaimer.
     """
 
-    def __init__(self, config_entry: "ConfigEntry") -> None:
-        """Initialise the options flow."""
-        self._config_entry = config_entry
-
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -388,7 +384,7 @@ class OneControlOptionsFlow(OptionsFlow):
                 {
                     vol.Required(
                         CONF_ENABLE_COVER_CONTROL,
-                        default=self._config_entry.options.get(
+                        default=self.config_entry.options.get(
                             CONF_ENABLE_COVER_CONTROL, False
                         ),
                     ): bool,

@@ -44,6 +44,11 @@ def _enabled_platforms(entry: ConfigEntry) -> list[str]:
     return platforms
 
 
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the entry when its options change so the new platform set applies."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Migrate config entry to new version."""
     _LOGGER.info(
@@ -168,13 +173,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     coordinator = OneControlCoordinator(hass, entry)
 
+    # Compute the platform list once and stash it alongside the coordinator so
+    # unload can tear down exactly what was forwarded (recomputing on unload
+    # would read the *new* options after a cover-control toggle and leave the
+    # cover platform loaded).
+    platforms = _enabled_platforms(entry)
+
     # Store coordinator for platform setup
     hass.data[DOMAIN][entry.entry_id] = coordinator
+    hass.data[DOMAIN][(entry.entry_id, "platforms")] = platforms
     _LOGGER.info(
         "Initialized OneControl coordinator for entry %s (instance=%s)",
         entry.entry_id,
         coordinator.instance_tag,
     )
+
+    # Reload when options change so toggling cover control takes effect.
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     # Connect in a background task so bootstrap completion isn't blocked.  Tie it
     # to the entry (not the global loop) so Home Assistant cancels it on unload —
@@ -186,16 +201,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "ha_onecontrol_initial_connect",
     )
 
-    await hass.config_entries.async_forward_entry_setups(entry, _enabled_platforms(entry))
+    await hass.config_entries.async_forward_entry_setups(entry, platforms)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, _enabled_platforms(entry))
+    platforms = hass.data[DOMAIN].get((entry.entry_id, "platforms"), PLATFORMS)
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
 
     if unload_ok:
         coordinator: OneControlCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
+        hass.data[DOMAIN].pop((entry.entry_id, "platforms"), None)
         _LOGGER.info(
             "Unloading OneControl coordinator for entry %s (instance=%s)",
             entry.entry_id,
