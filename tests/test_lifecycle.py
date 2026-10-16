@@ -1,4 +1,5 @@
-"""Tests for coordinator teardown, bond retention, NETWORK aggregation and heartbeat recovery."""
+"""Tests for coordinator teardown, bond retention, NETWORK aggregation,
+heartbeat recovery and entry reload/unload."""
 
 import asyncio
 import time
@@ -6,7 +7,13 @@ from types import SimpleNamespace
 
 from bleak.exc import BleakError
 
+import custom_components.ha_onecontrol as integration
 from custom_components.ha_onecontrol import coordinator as coordinator_module
+from custom_components.ha_onecontrol.const import (
+    CONF_BONDED_SOURCE,
+    CONF_ENABLE_COVER_CONTROL,
+    DOMAIN,
+)
 from custom_components.ha_onecontrol.coordinator import OneControlCoordinator
 
 HCI0_MAC = "11:11:11:11:11:11"
@@ -282,3 +289,75 @@ def test_stale_data_pushes_one_listener_update(monkeypatch) -> None:
     assert len(sent) == 3
     assert calls.listener_updates == 1
     assert calls.disconnects == []
+
+
+# ── Entry reload / unload (issue #16) ─────────────────────────────────
+
+
+def _entry(options: dict, data: dict | None = None):
+    return SimpleNamespace(entry_id="e1", data=data or {"address": "AA"}, options=options)
+
+
+def _reload_hass(entry):
+    reloads = []
+
+    async def async_reload(entry_id: str) -> None:
+        reloads.append(entry_id)
+
+    hass = SimpleNamespace(
+        data={DOMAIN: {("e1", "reload_snapshot"): integration._reload_snapshot(entry)}},
+        config_entries=SimpleNamespace(async_reload=async_reload),
+    )
+    return hass, reloads
+
+
+def test_bonded_source_write_does_not_reload() -> None:
+    entry = _entry({CONF_BONDED_SOURCE: "A0:AD:9F:71:28:58"})
+    hass, reloads = _reload_hass(entry)
+
+    entry.options = {CONF_BONDED_SOURCE: "3C:3B:AD:78:01:B3"}
+    asyncio.run(integration._async_update_listener(hass, entry))
+
+    assert reloads == []
+
+
+def test_user_option_change_still_reloads() -> None:
+    entry = _entry({CONF_BONDED_SOURCE: "A0:AD:9F:71:28:58"})
+    hass, reloads = _reload_hass(entry)
+
+    entry.options = {**entry.options, CONF_ENABLE_COVER_CONTROL: True}
+    asyncio.run(integration._async_update_listener(hass, entry))
+
+    assert reloads == ["e1"]
+
+
+def test_unload_closes_coordinator_before_platforms() -> None:
+    order = []
+
+    async def disconnect() -> None:
+        order.append("disconnect")
+
+    async def unload_platforms(entry, platforms) -> bool:
+        order.append("platforms")
+        return True
+
+    coordinator = SimpleNamespace(instance_tag="t", async_disconnect=disconnect)
+    hass = SimpleNamespace(
+        data={DOMAIN: {"e1": coordinator, ("e1", "platforms"): ["light"]}},
+        config_entries=SimpleNamespace(async_unload_platforms=unload_platforms),
+    )
+
+    assert asyncio.run(integration.async_unload_entry(hass, _entry({})))
+    assert order == ["disconnect", "platforms"]
+    assert hass.data[DOMAIN] == {}
+
+
+def test_closed_coordinator_drops_frames() -> None:
+    processed = []
+    coordinator = _coordinator(_closed=True)
+    coordinator._process_frame = processed.append
+
+    coordinator._on_data_read(None, bytearray(b"\x03\x01\x02\x00"))
+    coordinator._on_can_read(None, bytearray(b"\x02\x01\x02"))
+
+    assert processed == []

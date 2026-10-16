@@ -12,6 +12,7 @@ from homeassistant.helpers import entity_registry as er
 
 from .const import (
     CONF_BLUETOOTH_PIN,
+    CONF_BONDED_SOURCE,
     CONF_ENABLE_COVER_CONTROL,
     CONF_GATEWAY_FAMILY,
     CONF_PAIRING_METHOD,
@@ -46,8 +47,24 @@ def _enabled_platforms(entry: ConfigEntry) -> list[str]:
     return platforms
 
 
+def _reload_snapshot(entry: ConfigEntry) -> tuple[dict, dict]:
+    """Return the parts of *entry* whose change requires a reload.
+
+    CONF_BONDED_SOURCE is runtime state: the coordinator writes it after it
+    authenticates and reads it on every connect, so it needs no reload.
+    Reloading for it tore the entry down seconds after the first connect,
+    while the old coordinator was still discovering devices (issue #16).
+    """
+    options = {k: v for k, v in entry.options.items() if k != CONF_BONDED_SOURCE}
+    return dict(entry.data), options
+
+
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the entry when its options change so the new platform set applies."""
+    """Reload the entry when its data or user options change."""
+    key = (entry.entry_id, "reload_snapshot")
+    snapshot = _reload_snapshot(entry)
+    if hass.data[DOMAIN].get(key) == snapshot:
+        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 
@@ -184,6 +201,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Store coordinator for platform setup
     hass.data[DOMAIN][entry.entry_id] = coordinator
     hass.data[DOMAIN][(entry.entry_id, "platforms")] = platforms
+    hass.data[DOMAIN][(entry.entry_id, "reload_snapshot")] = _reload_snapshot(entry)
     _LOGGER.info(
         "Initialized OneControl coordinator for entry %s (instance=%s)",
         entry.entry_id,
@@ -220,17 +238,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     platforms = hass.data[DOMAIN].get((entry.entry_id, "platforms"), PLATFORMS)
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
 
-    if unload_ok:
-        coordinator: OneControlCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
-        hass.data[DOMAIN].pop((entry.entry_id, "platforms"), None)
+    # Close the coordinator before its platforms go.  A live coordinator keeps
+    # dispatching gateway frames while the platforms unload, and the discovery
+    # callbacks then add entities through platforms that are already gone.
+    # Those orphans keep the unique IDs, so the next setup's entities are
+    # rejected as duplicates and the orphans sit "unavailable" (issue #16).
+    coordinator: OneControlCoordinator | None = hass.data[DOMAIN].get(entry.entry_id)
+    if coordinator is not None:
         _LOGGER.info(
             "Unloading OneControl coordinator for entry %s (instance=%s)",
             entry.entry_id,
             coordinator.instance_tag,
         )
-        await coordinator.async_disconnect()
+        try:
+            await coordinator.async_disconnect()
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("Failed disconnecting OneControl coordinator on unload")
+
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, platforms)
+
+    if unload_ok:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        hass.data[DOMAIN].pop((entry.entry_id, "platforms"), None)
+        hass.data[DOMAIN].pop((entry.entry_id, "reload_snapshot"), None)
 
     return unload_ok
 

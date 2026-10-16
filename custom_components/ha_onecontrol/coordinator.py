@@ -2442,8 +2442,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             stored_source = self.entry.options.get(CONF_BONDED_SOURCE)
             if stored_source != self._current_connect_source:
                 _LOGGER.info(
-                    "Persisting bonded source %s for %s",
-                    self._current_connect_source, self.address,
+                    "Persisting bonded source %s for %s (was %s)",
+                    self._current_connect_source, self.address, stored_source,
                 )
                 self.hass.config_entries.async_update_entry(
                     self.entry,
@@ -2809,6 +2809,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
           0x03 = TwentyNineBit → one 29-bit IDS-CAN frame
         All other values: try V1 raw IDS-CAN parse directly.
         """
+        if self._closed:
+            return
         raw = bytes(data)
         # Update last event time for keepalive tracking
         self._last_event_time = time.monotonic()
@@ -4387,6 +4389,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self, characteristic: BleakGATTCharacteristic, data: bytearray
     ) -> None:
         """Receive raw bytes from DATA_READ, feed through COBS decoder."""
+        # A closed coordinator must not dispatch: its entities and platforms
+        # are being torn down (see async_unload_entry).
+        if self._closed:
+            return
         for byte_val in data:
             frame = self._decoder.decode_byte(byte_val)
             if frame is not None:
