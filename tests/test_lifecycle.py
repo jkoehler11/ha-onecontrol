@@ -1,7 +1,10 @@
-"""Tests for coordinator teardown, bond retention and NETWORK aggregation."""
+"""Tests for coordinator teardown, bond retention, NETWORK aggregation and heartbeat recovery."""
 
 import asyncio
+import time
 from types import SimpleNamespace
+
+from bleak.exc import BleakError
 
 from custom_components.ha_onecontrol import coordinator as coordinator_module
 from custom_components.ha_onecontrol.coordinator import OneControlCoordinator
@@ -168,3 +171,114 @@ def test_network_frames_aggregate_across_sources() -> None:
 
     assert coordinator.system_lockout_level == 0
     assert len(updates) == 3
+
+
+# ── Heartbeat recovery (issue #16) ────────────────────────────────────
+
+
+def _heartbeat_coordinator(monkeypatch, client, *, last_event_age: float, send=None):
+    monkeypatch.setattr(coordinator_module, "HEARTBEAT_INTERVAL", 0)
+    monkeypatch.setattr(coordinator_module, "_STALLED_DISCONNECT_TIMEOUT_S", 0.05)
+    calls = SimpleNamespace(disconnects=[], listener_updates=0)
+
+    async def default_send(table_id: int) -> None:
+        return None
+
+    coordinator = _coordinator(
+        _connected=True,
+        _authenticated=True,
+        _client=client,
+        _can_ble_confirmed=False,
+        gateway_info=SimpleNamespace(table_id=0x28),
+        _last_event_time=time.monotonic() - last_event_age,
+    )
+    coordinator._is_startup_bootstrap_active = lambda table_id: False
+    coordinator._send_get_devices_request = send or default_send
+
+    def on_disconnect(c) -> None:
+        calls.disconnects.append(c)
+        coordinator._connected = False
+
+    def update_listeners() -> None:
+        calls.listener_updates += 1
+
+    coordinator._on_disconnect = on_disconnect
+    coordinator.async_update_listeners = update_listeners
+    return coordinator, calls
+
+
+def test_stale_link_reconnects_when_disconnect_raises(monkeypatch) -> None:
+    async def disconnect() -> None:
+        raise BleakError("Not connected")
+
+    client = SimpleNamespace(disconnect=disconnect)
+    coordinator, calls = _heartbeat_coordinator(monkeypatch, client, last_event_age=1000)
+
+    asyncio.run(coordinator._heartbeat_loop())
+
+    assert calls.disconnects == [client]
+
+
+def test_stale_link_reconnects_when_disconnect_hangs(monkeypatch) -> None:
+    async def disconnect() -> None:
+        await asyncio.sleep(60)
+
+    client = SimpleNamespace(disconnect=disconnect)
+    coordinator, calls = _heartbeat_coordinator(monkeypatch, client, last_event_age=1000)
+
+    asyncio.run(coordinator._heartbeat_loop())
+
+    assert calls.disconnects == [client]
+
+
+def test_stale_link_disconnect_callback_is_not_doubled(monkeypatch) -> None:
+    async def disconnect() -> None:
+        coordinator._on_disconnect(client)
+
+    client = SimpleNamespace(disconnect=disconnect)
+    coordinator, calls = _heartbeat_coordinator(monkeypatch, client, last_event_age=1000)
+
+    asyncio.run(coordinator._heartbeat_loop())
+
+    assert calls.disconnects == [client]
+
+
+def test_heartbeat_write_failure_reconnects(monkeypatch) -> None:
+    disconnected = []
+
+    async def disconnect() -> None:
+        disconnected.append(True)
+
+    async def send(table_id: int) -> None:
+        raise BleakError("write failed")
+
+    client = SimpleNamespace(disconnect=disconnect)
+    coordinator, calls = _heartbeat_coordinator(
+        monkeypatch, client, last_event_age=1, send=send
+    )
+
+    asyncio.run(coordinator._heartbeat_loop())
+
+    assert disconnected == [True]
+    assert calls.disconnects == [client]
+
+
+def test_stale_data_pushes_one_listener_update(monkeypatch) -> None:
+    sent = []
+
+    async def send(table_id: int) -> None:
+        sent.append(table_id)
+        if len(sent) == 3:
+            coordinator._authenticated = False
+
+    client = SimpleNamespace(disconnect=None)
+    # Past the 15 s health window but short of the 300 s stale timeout.
+    coordinator, calls = _heartbeat_coordinator(
+        monkeypatch, client, last_event_age=20, send=send
+    )
+
+    asyncio.run(coordinator._heartbeat_loop())
+
+    assert len(sent) == 3
+    assert calls.listener_updates == 1
+    assert calls.disconnects == []

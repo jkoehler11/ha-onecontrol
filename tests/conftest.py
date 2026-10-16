@@ -76,3 +76,6 @@ for _name in [
     "bleak_retry_connector",
 ]:
     _stub(_name)
+
+# Code under test raises and catches BleakError, so it must be a real exception.
+sys.modules["bleak.exc"].BleakError = type("BleakError", (Exception,), {})

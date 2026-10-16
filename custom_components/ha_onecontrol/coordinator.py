@@ -186,6 +186,9 @@ _STARTUP_BOOTSTRAP_MAX_BACKOFF_SECONDS = 30.0
 # Total wall-clock seconds to keep retrying bootstrap before giving up.
 # Covers gateways that need minutes to fully boot after a power cycle.
 _STARTUP_BOOTSTRAP_TIMEOUT_SECONDS = 600.0
+# Upper bound on disconnect() when the heartbeat drops a stalled link; past it
+# the coordinator tears down without waiting for BlueZ.
+_STALLED_DISCONNECT_TIMEOUT_S = 10.0
 
 # Seconds to wait after metadata loads before seeding entities for silent
 # (always-off) devices.  Lets the initial BLE event burst settle first.
@@ -4310,13 +4313,28 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Also monitors data freshness — if no events for STALE_CONNECTION_TIMEOUT
         seconds, forces a reconnect.
 
+        On the MyRvLink path this loop is the only stale check, so every
+        abnormal exit drops the link and makes sure a reconnect is scheduled.
+        Exiting while the link still looked connected left the coordinator
+        "connected" with no heartbeat, and it never recovered (issue #16).
+
         Reference: Android HEARTBEAT_INTERVAL_MS = 5000L
         """
+        client = self._client
+        was_healthy = True
         try:
             while self._connected and self._authenticated:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
                 if not self._connected or not self.gateway_info:
                     break
+
+                # Entities only re-evaluate availability when they write state,
+                # and a silent gateway triggers no writes.  Push one update when
+                # data goes stale so all entities go unavailable together.
+                healthy = self.data_healthy
+                if was_healthy and not healthy:
+                    self.async_update_listeners()
+                was_healthy = healthy
 
                 # Stale connection detection
                 if (
@@ -4327,11 +4345,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "No events for %.0fs — connection stale, forcing reconnect",
                         STALE_CONNECTION_TIMEOUT,
                     )
-                    if self._client:
-                        try:
-                            await self._client.disconnect()
-                        except Exception:
-                            pass
+                    await self._drop_stalled_link(client)
                     break
 
                 try:
@@ -4339,14 +4353,31 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         continue
                     await self._send_get_devices_request(self.gateway_info.table_id)
                 except BleakError as exc:
-                    _LOGGER.warning("Heartbeat BLE write failed: %s", exc)
+                    _LOGGER.warning("Heartbeat BLE write failed: %s — forcing reconnect", exc)
+                    await self._drop_stalled_link(client)
                     break
                 except Exception:  # noqa: BLE001
-                    _LOGGER.exception("Heartbeat error")
+                    _LOGGER.exception("Heartbeat error — forcing reconnect")
+                    await self._drop_stalled_link(client)
                     break
         except asyncio.CancelledError:
             pass
         _LOGGER.debug("Heartbeat loop exited")
+
+    async def _drop_stalled_link(self, client: BleakClient | None) -> None:
+        """Disconnect a link the heartbeat gave up on, and make sure it reconnects.
+
+        disconnect() normally fires _on_disconnect, which schedules the
+        reconnect.  When it raises, hangs, or the callback never comes, trigger
+        _on_disconnect ourselves — same recovery as the CAN BLE keepalive.
+        """
+        if client is not None:
+            try:
+                await asyncio.wait_for(client.disconnect(), _STALLED_DISCONNECT_TIMEOUT_S)
+            except Exception:  # noqa: BLE001
+                pass
+        if self._connected and self._client is client:
+            self._on_disconnect(client)
 
     # ------------------------------------------------------------------
     # DATA_READ notification handler (COBS stream)
