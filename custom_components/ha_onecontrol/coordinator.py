@@ -70,7 +70,7 @@ from .const import (
     COVER_CEILING_CAP_S,
     COVER_START_TIMEOUT_S,
     COVER_STOP_TIMEOUT_S,
-
+    RC_SESSION_CONFIRMED_RELEASE_S,
     RC_SESSION_IDLE_RELEASE_S,
     RC_SESSION_JANITOR_INTERVAL_S,
     RC_SESSION_RELEASE_TIMEOUT_S,
@@ -554,6 +554,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # deliberately NOT cleared on disconnect: the session outlives the link,
         # so an unreleased one has to be closed after the reconnect.
         self._rc_session_dirty: dict[int, float] = {}
+        # Devices whose current COMMAND was confirmed from DEVICE_STATUS.  Those
+        # sessions are released as soon as the write is known to have landed,
+        # instead of after the longer unconfirmed grace.
+        self._rc_session_confirmed: set[int] = set()
         self._rc_janitor_task: asyncio.Task | None = None
         self._can_time_source: int | None = None
         # Source address used by official app host-side IDS-CAN requests.
@@ -921,10 +925,18 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             try:
                 verify_timeout = self._can_command_verify_timeout()
+                # Stamp BEFORE the write: the janitor must never act on the
+                # previous command's grace while this write is in flight, and a
+                # fresh COMMAND clears any confirmation from the previous one.
+                self._note_rc_session_command(device_id)
                 await self._write_can_frame(self._client, frame, label="relay COMMAND")
-                if not await self._wait_for_can_relay_state(
+                if await self._wait_for_can_relay_state(
                     device_id, state, timeout=verify_timeout
                 ):
+                    # The device reports the requested state, so the COMMAND
+                    # landed — the session can be handed back promptly.
+                    self._mark_rc_session_confirmed(device_id)
+                else:
                     _LOGGER.warning(
                         "CAN BLE: relay COMMAND not confirmed from DEVICE_STATUS for device=0x%02X state=%s within %.2fs; retrying once",
                         device_id,
@@ -942,10 +954,13 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                             self._can_ble_gateway_version,
                         )
                         return
+                    self._note_rc_session_command(device_id)
                     await self._write_can_frame(self._client, frame, label="relay COMMAND retry")
-                    if not await self._wait_for_can_relay_state(
+                    if await self._wait_for_can_relay_state(
                         device_id, state, timeout=verify_timeout
                     ):
+                        self._mark_rc_session_confirmed(device_id)
+                    else:
                         _LOGGER.warning(
                             "CAN BLE: relay COMMAND retry still unconfirmed for device=0x%02X state=%s within %.2fs",
                             device_id,
@@ -954,9 +969,6 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
             except BleakError as exc:
                 _LOGGER.warning("CAN BLE: relay COMMAND failed: %s", exc)
-            # Keep the session alive across the confirmation window; the janitor
-            # releases it once the device has been quiet for a while.
-            self._note_rc_session_command(device_id)
         else:
             frame = compose_ids_can_extended_wire_frame(
                 message_type=0x82,
@@ -1021,8 +1033,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     frame.hex(),
                 )
                 try:
-                    await self._write_can_frame(self._client, frame, label="cover COMMAND")
                     self._note_rc_session_command(device_id)
+                    await self._write_can_frame(self._client, frame, label="cover COMMAND")
                 except BleakError as exc:
                     _LOGGER.warning("CAN BLE: cover STOP failed: %s", exc)
             else:
@@ -3776,8 +3788,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     device_id,
                     current_frame.hex(),
                 )
-                await self._write_can_frame(client, current_frame, label="queued COMMAND")
                 self._note_rc_session_command(device_id)
+                await self._write_can_frame(client, current_frame, label="queued COMMAND")
                 await asyncio.sleep(0.1)
             except Exception as exc:
                 _LOGGER.warning("CAN BLE: failed to flush queued command: %s", exc)
@@ -4304,6 +4316,18 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """
         if self._rc_session_target == device_id:
             self._rc_session_dirty[device_id] = time.monotonic()
+            # A fresh COMMAND is unconfirmed until its own feedback arrives.
+            self._rc_session_confirmed.discard(device_id)
+
+    def _mark_rc_session_confirmed(self, device_id: int) -> None:
+        """Note that DEVICE_STATUS confirmed the COMMAND for *device_id*.
+
+        The session exists to get one COMMAND accepted.  Once the device reports
+        the requested state there is nothing left to hold it for, and holding it
+        keeps the coach's physical panel locked out of that device.
+        """
+        if self._rc_session_target == device_id:
+            self._rc_session_confirmed.add(device_id)
 
     def _start_rc_session_janitor(self) -> None:
         """Start the idle-session janitor if it is not already running."""
@@ -4352,7 +4376,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # A cover movement holds the session for its whole travel window.
             if self._cover_movement_active(device_id):
                 continue
-            if now - last_command < RC_SESSION_IDLE_RELEASE_S:
+            grace = (
+                RC_SESSION_CONFIRMED_RELEASE_S
+                if device_id in self._rc_session_confirmed
+                else RC_SESSION_IDLE_RELEASE_S
+            )
+            if now - last_command < grace:
                 continue
             await self._async_close_remote_control_session(
                 device_id, "idle since last command"
@@ -4462,6 +4491,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return
         self._rc_session_dirty.pop(target, None)
+        self._rc_session_confirmed.discard(target)
 
     async def _rc_session_heartbeat(self, client: BleakClient, device_id: int) -> None:
         """Send SESSION_HEARTBEAT (0x44) to keep the REMOTE_CONTROL session alive.

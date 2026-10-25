@@ -62,6 +62,7 @@ class SessionHarness:
         c._rc_session_target = IDLE_DEVICE
         c._rc_session_sid_bytes = bytes([0x00, 0x04])
         c._rc_session_dirty = {IDLE_DEVICE: time.monotonic()}
+        c._rc_session_confirmed = set()
         c._rc_janitor_task = None
         c._rc_heartbeat_task = None
         c._cover_command_tasks = {}
@@ -98,8 +99,9 @@ def _install_writer(harness: SessionHarness) -> None:
 
 @pytest.fixture(autouse=True)
 def fast_release(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Shrink the grace period and janitor interval for the tests."""
+    """Shrink the grace periods and janitor interval for the tests."""
     monkeypatch.setattr(coordinator_module, "RC_SESSION_IDLE_RELEASE_S", 0.2)
+    monkeypatch.setattr(coordinator_module, "RC_SESSION_CONFIRMED_RELEASE_S", 0.05)
     monkeypatch.setattr(coordinator_module, "RC_SESSION_JANITOR_INTERVAL_S", 0.05)
 
 
@@ -277,3 +279,181 @@ def test_failed_release_is_retried_after_another_grace_period() -> None:
 
     assert IDLE_DEVICE in harness.c._rc_session_dirty
     assert time.monotonic() - harness.c._rc_session_dirty[IDLE_DEVICE] < 5.0
+
+
+def test_confirmed_command_is_released_sooner_than_an_unconfirmed_one() -> None:
+    """A confirmed COMMAND frees the panel as soon as it has landed.
+
+    The panel is refused for as long as the session is held, so the window is
+    sized by what the COMMAND needs, not by how long confirmation may take.
+    """
+
+    async def scenario() -> tuple[SessionHarness, SessionHarness]:
+        now = time.monotonic()
+
+        unconfirmed = SessionHarness()
+        _install_writer(unconfirmed)
+        unconfirmed.c._rc_session_dirty = {IDLE_DEVICE: now - 0.1}
+
+        confirmed = SessionHarness()
+        _install_writer(confirmed)
+        confirmed.c._rc_session_dirty = {IDLE_DEVICE: now - 0.1}
+        confirmed.c._mark_rc_session_confirmed(IDLE_DEVICE)
+
+        await unconfirmed.c._async_reap_idle_rc_sessions()
+        await confirmed.c._async_reap_idle_rc_sessions()
+        return unconfirmed, confirmed
+
+    unconfirmed, confirmed = asyncio.run(scenario())
+
+    assert unconfirmed.closes() == [], "an unconfirmed COMMAND keeps its grace period"
+    assert confirmed.closes() == ["SESSION_CLOSE"]
+    assert IDLE_DEVICE in unconfirmed.c._rc_session_dirty
+    assert confirmed.c._rc_session_dirty == {}
+
+
+def test_new_command_clears_the_previous_confirmation() -> None:
+    """A fresh write is unconfirmed again until its own feedback arrives."""
+
+    async def scenario() -> SessionHarness:
+        harness = SessionHarness()
+        _install_writer(harness)
+        harness.c._mark_rc_session_confirmed(IDLE_DEVICE)
+        harness.c._note_rc_session_command(IDLE_DEVICE)
+        await asyncio.sleep(0.12)  # past the confirmed grace, inside the idle one
+        await harness.c._async_reap_idle_rc_sessions()
+        return harness
+
+    harness = asyncio.run(scenario())
+
+    assert harness.closes() == []
+    assert harness.c._rc_session_confirmed == set()
+
+
+def test_close_forgets_the_confirmation() -> None:
+    """Nothing stale is left behind for the next command on that device."""
+
+    async def scenario() -> SessionHarness:
+        harness = SessionHarness()
+        _install_writer(harness)
+        harness.c._mark_rc_session_confirmed(IDLE_DEVICE)
+        await harness.c._async_close_remote_control_session(IDLE_DEVICE, "test")
+        return harness
+
+    harness = asyncio.run(scenario())
+
+    assert harness.closes() == ["SESSION_CLOSE"]
+    assert harness.c._rc_session_confirmed == set()
+
+
+def test_relay_command_marks_its_session_confirmed() -> None:
+    """A confirmed relay COMMAND must leave the session confirmed, not cleared.
+
+    Ordering matters here: stamping the write clears any previous confirmation,
+    so the confirmation has to be recorded *after* the write is noted.
+    """
+
+    async def scenario() -> SessionHarness:
+        harness = SessionHarness()
+
+        async def _advertise(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        async def _ensure(client: Any, device_id: int) -> bool:
+            harness.c._rc_session_open = True
+            harness.c._rc_session_target = device_id
+            return True
+
+        async def _confirmed(device_id: int, state: bool, *, timeout: float) -> bool:
+            return True
+
+        harness.c._advertise_can_local_host_identity = _advertise
+        harness.c._ensure_remote_control_session = _ensure
+        harness.c._wait_for_can_relay_state = _confirmed
+        harness.c._can_ble_gateway_version = "Unknown"
+        harness.c.relays = {}
+        harness.c._is_can_ble_v1_gateway = lambda: False
+        _install_writer(harness)
+
+        await harness.c.async_can_switch(IDLE_DEVICE, True)
+        return harness
+
+    harness = asyncio.run(scenario())
+
+    assert IDLE_DEVICE in harness.c._rc_session_confirmed
+    assert IDLE_DEVICE in harness.c._rc_session_dirty
+
+
+def test_release_all_sessions_shares_one_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Teardown gets ONE bound for the whole sweep, not one per device.
+
+    Otherwise three owed sessions can hold up an unload for three times the
+    timeout on a single wedged write.
+    """
+    monkeypatch.setattr(coordinator_module, "RC_SESSION_RELEASE_TIMEOUT_S", 0.2)
+
+    async def scenario() -> float:
+        harness = SessionHarness()
+
+        async def _hang(client: Any, frame: Any, *, label: str = "") -> None:
+            await asyncio.sleep(3600)
+
+        harness.c._write_can_frame = _hang
+        now = time.monotonic()
+        harness.c._rc_session_dirty = {
+            IDLE_DEVICE: now,
+            LIVE_DEVICE: now,
+            0x0C: now,
+        }
+        began = time.monotonic()
+        await harness.c._async_release_all_rc_sessions("coordinator shutting down")
+        return time.monotonic() - began
+
+    elapsed = asyncio.run(scenario())
+
+    # Per-device bounds would take >= 0.6s here (3 x 0.2s).
+    assert elapsed < 0.4, f"teardown was bounded per device ({elapsed:.2f}s)"
+
+
+def test_relay_command_is_stamped_before_the_write() -> None:
+    """The session must be stamped BEFORE the frame goes out.
+
+    A janitor tick during the write sees the previous command's grace period
+    otherwise, and can close the session out from under an in-flight command.
+    """
+
+    async def scenario() -> list[bool]:
+        harness = SessionHarness()
+        stamped_at_write: list[bool] = []
+
+        async def _advertise(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        async def _ensure(client: Any, device_id: int) -> bool:
+            harness.c._rc_session_open = True
+            harness.c._rc_session_target = device_id
+            return True
+
+        async def _confirmed(device_id: int, state: bool, *, timeout: float) -> bool:
+            return True
+
+        async def _write(client: Any, frame: Any, *, label: str = "") -> None:
+            if label == "relay COMMAND":
+                stamped_at_write.append(IDLE_DEVICE in harness.c._rc_session_dirty)
+
+        harness.c._advertise_can_local_host_identity = _advertise
+        harness.c._ensure_remote_control_session = _ensure
+        harness.c._wait_for_can_relay_state = _confirmed
+        harness.c._can_ble_gateway_version = "Unknown"
+        harness.c.relays = {}
+        harness.c._is_can_ble_v1_gateway = lambda: False
+        harness.c._write_can_frame = _write
+
+        await harness.c.async_can_switch(IDLE_DEVICE, True)
+        return stamped_at_write
+
+    stamped = asyncio.run(scenario())
+
+    assert stamped == [True], (
+        "the COMMAND was written before its session was stamped"
+    )

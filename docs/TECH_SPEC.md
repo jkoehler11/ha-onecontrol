@@ -374,16 +374,37 @@ is released by a **janitor**, not on the command path:
   the monotonic time of the last COMMAND written in it.  It survives a
   disconnect on purpose — the debt outlives the link.
 - `_note_rc_session_command()` refreshes that timestamp from every COMMAND site
-  (relay, relay retry, queued replay, cover command).
-- `_rc_session_janitor()` ticks every `RC_SESSION_JANITOR_INTERVAL_S` (1 s) and
-  `_async_reap_idle_rc_sessions()` closes a device once nothing has written to
-  it for `RC_SESSION_IDLE_RELEASE_S` (8 s) and no cover movement holds it.  The
-  grace period must stay well above the relay confirmation window
-  (`_CAN_COMMAND_VERIFY_TIMEOUT_S` / `..._V1_S`): the close must never race the
-  write it exists for.
+  (relay, relay retry, queued replay, cover command).  It runs **before** the
+  frame is written, not after: a stamp taken afterwards leaves the previous
+  command's grace period in place for the duration of the write, so a janitor
+  tick landing inside that write can close the session out from under it.  A
+  fresh COMMAND also clears the previous confirmation, which is why the
+  confirmation is recorded after the write.
+- `_rc_session_janitor()` ticks every `RC_SESSION_JANITOR_INTERVAL_S` (0.5 s) and
+  `_async_reap_idle_rc_sessions()` closes a device once it has nothing left to
+  hold the session for and no cover movement is using it.  What counts as "left"
+  depends on the feedback: a COMMAND the device confirmed from DEVICE_STATUS is
+  released after `RC_SESSION_CONFIRMED_RELEASE_S` (0.75 s — the device has
+  already applied it), an unconfirmed one after `RC_SESSION_IDLE_RELEASE_S`
+  (2 s).  Both are measured from the write, and a fresh COMMAND clears the
+  previous confirmation.  "A cover movement holds this session" is decided on
+  the device half of the `"tt:dd"` cover key, the same identity
+  `_cover_command_tasks` and `covers` use.
+
+  The window is deliberately sized by what the COMMAND needs, not by how long
+  confirmation may take.  Holding the session is what locks the coach's physical
+  panel out, so a session kept for the length of the relay verification window
+  (`_CAN_COMMAND_VERIFY_TIMEOUT_S` / `..._V1_S`, 3 s and 5 s) made the panel
+  ignore presses for seconds after every Home Assistant toggle — the first cut
+  of this fix did exactly that, and users read it as a 3–5 s lag.  Confirmation
+  itself does not need the session: DEVICE_STATUS broadcast frames arrive
+  regardless of who holds it.
 - The janitor also starts with the CAN keepalive, so sessions owed from before a
   reconnect are closed on the next connect, and `async_disconnect()` releases
-  everything still owed before the link goes.
+  everything still owed before the link goes.  That teardown sweep is bounded
+  **once** (`RC_SESSION_RELEASE_TIMEOUT_S`) for all of it — a per-device bound
+  lets several owed sessions hold up an unload by a multiple of the timeout —
+  and anything not released keeps its debt for the next janitor pass.
 
 **Do not close a session on the command path.**  v1.0.48 did exactly that after
 relay commands and had to be reverted: the device began terminating sessions
@@ -395,8 +416,6 @@ A close that fails keeps its debt and is re-stamped, so the next janitor pass
 retries after another grace period instead of spinning on a failing write.
 Closing a device that a previous command left behind does not touch the live
 session's heartbeat.
-
-### Safety timeout
 
 ## 11. Evolution Notes (Commit History)
 
