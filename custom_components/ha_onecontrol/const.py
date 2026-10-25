@@ -197,5 +197,21 @@ COVER_START_TIMEOUT_S = 10.0
 # would keep the session release and the task teardown from ever running.
 COVER_STOP_TIMEOUT_S = 2.0
 
+# A REMOTE_CONTROL session belongs to whoever opened it until it is explicitly
+# closed, and the device keeps it even when the BLE link drops — so a session
+# that is opened and forgotten leaves the coach's physical panel locked out of
+# that device until the gateway is power-cycled.  Sessions are therefore reaped
+# once they have been quiet for this long.  It must stay comfortably above the
+# relay confirmation window (`_CAN_COMMAND_VERIFY_TIMEOUT_S` / `..._V1_S`, 3 s
+# and 5 s): the close must never race the write the session exists for.
+RC_SESSION_IDLE_RELEASE_S = 8.0
+
+# How often the session janitor looks for sessions nothing is using.
+RC_SESSION_JANITOR_INTERVAL_S = 1.0
+
+# Hard bound on a session release during teardown: the release runs when the
+# link is already being torn down, so it must not be able to hold up unloading.
+RC_SESSION_RELEASE_TIMEOUT_S = 2.0
+
 GATEWAY_FAMILY_LEGACY = "legacy"
 GATEWAY_FAMILY_X180T = "x180t_can_ble"

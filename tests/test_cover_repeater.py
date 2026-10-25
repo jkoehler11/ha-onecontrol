@@ -71,6 +71,10 @@ class RepeaterHarness:
         c._can_read_subscribed = True
         c._rc_session_open = session_open
         c._rc_session_target = DEVICE_ID if session_open else None
+        # Session-release bookkeeping the COMMAND paths touch.
+        c._rc_session_dirty = {}
+        c._rc_session_confirmed = set()
+        c._rc_janitor_task = None
         c._gateway_can_address = GATEWAY_ADDRESS
         c.hass = _FakeHass()
 

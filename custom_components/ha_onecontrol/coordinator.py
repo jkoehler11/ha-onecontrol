@@ -70,6 +70,10 @@ from .const import (
     COVER_CEILING_CAP_S,
     COVER_START_TIMEOUT_S,
     COVER_STOP_TIMEOUT_S,
+
+    RC_SESSION_IDLE_RELEASE_S,
+    RC_SESSION_JANITOR_INTERVAL_S,
+    RC_SESSION_RELEASE_TIMEOUT_S,
     DOMAIN,
     GATEWAY_FAMILY_LEGACY,
     GATEWAY_FAMILY_X180T,
@@ -545,6 +549,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._rc_session_last_status_code: int | None = None
         self._rc_heartbeat_task: asyncio.Task | None = None
         self._rc_session_lock: asyncio.Lock = asyncio.Lock()
+        # Devices we have opened a session on and not yet closed, with the
+        # monotonic time of the last COMMAND written in that session.  This is
+        # deliberately NOT cleared on disconnect: the session outlives the link,
+        # so an unreleased one has to be closed after the reconnect.
+        self._rc_session_dirty: dict[int, float] = {}
+        self._rc_janitor_task: asyncio.Task | None = None
         self._can_time_source: int | None = None
         # Source address used by official app host-side IDS-CAN requests.
         self._gateway_can_address: int = 0xFA
@@ -944,6 +954,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
             except BleakError as exc:
                 _LOGGER.warning("CAN BLE: relay COMMAND failed: %s", exc)
+            # Keep the session alive across the confirmation window; the janitor
+            # releases it once the device has been quiet for a while.
+            self._note_rc_session_command(device_id)
         else:
             frame = compose_ids_can_extended_wire_frame(
                 message_type=0x82,
@@ -1009,6 +1022,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 try:
                     await self._write_can_frame(self._client, frame, label="cover COMMAND")
+                    self._note_rc_session_command(device_id)
                 except BleakError as exc:
                     _LOGGER.warning("CAN BLE: cover STOP failed: %s", exc)
             else:
@@ -1135,6 +1149,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             payload=b"",
         )
         try:
+            # Stamp the session BEFORE the write: the janitor must never see a
+            # stale grace period (from the previous COMMAND) while this write is
+            # in flight, or it can close the session out from under it.
+            self._note_rc_session_command(device_id)
             await self._write_can_frame(self._client, frame, label="cover COMMAND")
             return True
         except Exception as exc:
@@ -2009,6 +2027,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._stop_heartbeat()
         self._cancel_startup_bootstrap()
         self._cancel_reconnect()
+        self._stop_rc_session_janitor()
+        # Hand back any session we still own BEFORE the link goes: the device
+        # keeps a session after a disconnect, so unloading or reloading the
+        # entry would otherwise leave the panel locked out until a power cycle.
+        if self._rc_session_dirty and self._client and self._connected:
+            await self._async_release_all_rc_sessions("coordinator shutting down")
         self._connected = False
         self._authenticated = False
         if self._client:
@@ -3117,6 +3141,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._can_keepalive_loop(client), name="ha_onecontrol_can_keepalive"
         )
         _LOGGER.debug("CAN BLE: keepalive loop started for persistent connection")
+        # Reap sessions owed from a previous link: the device keeps a session
+        # open after the link drops, so a reconnect is the first chance to close it.
+        self._start_rc_session_janitor()
 
 
     def _on_can_read(
@@ -3750,6 +3777,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     current_frame.hex(),
                 )
                 await self._write_can_frame(client, current_frame, label="queued COMMAND")
+                self._note_rc_session_command(device_id)
                 await asyncio.sleep(0.1)
             except Exception as exc:
                 _LOGGER.warning("CAN BLE: failed to flush queued command: %s", exc)
@@ -4198,6 +4226,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             self._rc_session_open = True
             self._rc_session_target = device_id
+            self._rc_session_dirty[device_id] = time.monotonic()
+            self._start_rc_session_janitor()
             _LOGGER.info(
                 "CAN BLE: REMOTE_CONTROL session established for device 0x%02X", device_id
             )
@@ -4265,6 +4295,99 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as exc:  # noqa: BLE001
             _LOGGER.warning("CAN BLE: session preflight query failed: %s", exc)
 
+    def _note_rc_session_command(self, device_id: int) -> None:
+        """Record that a COMMAND frame was just written for *device_id*.
+
+        The janitor releases a session once it has been quiet for
+        ``RC_SESSION_IDLE_RELEASE_S``, so every COMMAND counts as activity: a
+        cover mid-travel and a burst of relay changes both keep their session.
+        """
+        if self._rc_session_target == device_id:
+            self._rc_session_dirty[device_id] = time.monotonic()
+
+    def _start_rc_session_janitor(self) -> None:
+        """Start the idle-session janitor if it is not already running."""
+        if self._rc_janitor_task is not None and not self._rc_janitor_task.done():
+            return
+        self._rc_janitor_task = self.hass.async_create_background_task(
+            self._rc_session_janitor(), name="ha_onecontrol_rc_session_janitor"
+        )
+
+    def _stop_rc_session_janitor(self) -> None:
+        """Cancel the idle-session janitor (the owed-session map is kept)."""
+        if self._rc_janitor_task is not None and not self._rc_janitor_task.done():
+            self._rc_janitor_task.cancel()
+        self._rc_janitor_task = None
+
+    async def _rc_session_janitor(self) -> None:
+        """Release REMOTE_CONTROL sessions that nothing is using any more.
+
+        A session belongs to whoever opened it until it is explicitly closed,
+        and the device keeps it even after the BLE link drops.  Opening a
+        session for a relay command and never closing it therefore leaves the
+        coach's physical panel locked out of that device until the gateway is
+        power-cycled — which is the whole point of reaping them here.
+
+        The release lives here, not on the command path, on purpose: closing
+        immediately after a relay write is what broke relays before (session
+        terminations with reason 0x0E, COMMANDs unconfirmed, state reverting),
+        so the close has to happen well after the write, from outside it.
+        """
+        try:
+            while self._connected:
+                await asyncio.sleep(RC_SESSION_JANITOR_INTERVAL_S)
+                try:
+                    await self._async_reap_idle_rc_sessions()
+                except Exception as exc:  # noqa: BLE001
+                    _LOGGER.debug("CAN BLE: session janitor tick failed: %s", exc)
+        except asyncio.CancelledError:
+            pass
+
+    async def _async_reap_idle_rc_sessions(self) -> None:
+        """Close sessions that are idle and not owned by a cover movement."""
+        if not self._rc_session_dirty:
+            return
+        now = time.monotonic()
+        for device_id, last_command in list(self._rc_session_dirty.items()):
+            # A cover movement holds the session for its whole travel window.
+            if self._cover_movement_active(device_id):
+                continue
+            if now - last_command < RC_SESSION_IDLE_RELEASE_S:
+                continue
+            await self._async_close_remote_control_session(
+                device_id, "idle since last command"
+            )
+
+    def _cover_movement_active(self, device_id: int) -> bool:
+        """Return True if a running cover movement owns *device_id*.
+
+        ``_cover_command_tasks`` is keyed by the ``"tt:dd"`` cover key the
+        ``covers`` map uses, so the device id cannot be used as a bare dict
+        key here — match on the device half of the key instead.
+        """
+        suffix = f":{device_id:02x}"
+        return any(key.endswith(suffix) for key in self._cover_command_tasks)
+
+    async def _async_release_all_rc_sessions(self, reason: str) -> None:
+        """Close every session this coordinator still owes, best effort.
+
+        Bounded: this runs during teardown, where a hung write must not keep the
+        entry from unloading.
+        """
+        try:
+            # ONE bound for the whole sweep: teardown must not be held up by a
+            # multiple of this value when several sessions are owed.  Anything
+            # still owed keeps its debt and is retried by the janitor.
+            async with asyncio.timeout(RC_SESSION_RELEASE_TIMEOUT_S):
+                for device_id in list(self._rc_session_dirty):
+                    await self._async_close_remote_control_session(device_id, reason)
+        except TimeoutError:
+            _LOGGER.warning(
+                "CAN BLE: session release did not finish within %.1fs (%s)",
+                RC_SESSION_RELEASE_TIMEOUT_S,
+                reason,
+            )
+
     async def _async_close_remote_control_session(
         self, device_id: int | None = None, reason: str = ""
     ) -> None:
@@ -4298,15 +4421,20 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         client = self._client
         sid_bytes = self._rc_session_sid_bytes
 
-        if self._rc_heartbeat_task and not self._rc_heartbeat_task.done():
-            self._rc_heartbeat_task.cancel()
-        self._rc_heartbeat_task = None
-        self._rc_session_open = False
-        self._rc_session_target = None
+        # Only tear down the in-memory session state when this is the session we
+        # currently hold.  Releasing a device that a *previous* command left
+        # behind must not cancel the heartbeat of the live one.
+        if target == self._rc_session_target:
+            if self._rc_heartbeat_task and not self._rc_heartbeat_task.done():
+                self._rc_heartbeat_task.cancel()
+            self._rc_heartbeat_task = None
+            self._rc_session_open = False
+            self._rc_session_target = None
 
         if not (client and self._connected and self._can_read_subscribed):
-            # Link already gone — nothing to send; the gateway drops the
-            # session with the connection.
+            # Link already gone — the frame cannot go out now, but the device
+            # still counts the session as open (it survives a link drop), so the
+            # debt is kept and retried by the janitor after the reconnect.
             return
 
         frame = compose_ids_can_extended_wire_frame(
@@ -4324,11 +4452,16 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 reason or "done",
             )
         except Exception as exc:  # noqa: BLE001
+            # Keep the debt and re-stamp it: the next janitor pass retries after
+            # another full grace period instead of spinning on a failing write.
+            self._rc_session_dirty[target] = time.monotonic()
             _LOGGER.warning(
                 "CAN BLE: failed to release REMOTE_CONTROL session on device 0x%02X: %s",
                 target,
                 exc,
             )
+            return
+        self._rc_session_dirty.pop(target, None)
 
     async def _rc_session_heartbeat(self, client: BleakClient, device_id: int) -> None:
         """Send SESSION_HEARTBEAT (0x44) to keep the REMOTE_CONTROL session alive.
@@ -5449,6 +5582,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._rc_heartbeat_task and not self._rc_heartbeat_task.done():
             self._rc_heartbeat_task.cancel()
         self._rc_heartbeat_task = None
+        # Keep _rc_session_dirty: the device keeps the session, so it still has
+        # to be released once the link is back.
+        self._stop_rc_session_janitor()
         if self._can_keepalive_task and not self._can_keepalive_task.done():
             _LOGGER.debug("Cancelling CAN keepalive task on disconnect")
             self._can_keepalive_task.cancel()

@@ -357,6 +357,47 @@ Added (2026-09-03) after a runaway awning event; reshaped (2026-10-04) to split
 travel time from the derived ceiling per multi-cover review feedback; travel
 clock and bounded failsafe (2026-10-25) after multi-cover rig testing.
 
+### Releasing sessions: the panel must get the device back
+
+A REMOTE_CONTROL session belongs to whoever opened it until it is explicitly
+closed (request `0x45`), and the device keeps it even when the BLE link drops —
+dropping the heartbeat is not enough, and neither is losing the connection.  A
+session left open makes the coach's physical panel refuse that device until the
+gateway is power-cycled, while Home Assistant keeps working, which makes it look
+like a control has simply died.
+
+Every COMMAND needs a session, so every COMMAND path must give it back.  The
+cover repeater closes its own session in `finally` (see above).  Everything else
+is released by a **janitor**, not on the command path:
+
+- `_rc_session_dirty` records each device with an open, unreleased session and
+  the monotonic time of the last COMMAND written in it.  It survives a
+  disconnect on purpose — the debt outlives the link.
+- `_note_rc_session_command()` refreshes that timestamp from every COMMAND site
+  (relay, relay retry, queued replay, cover command).
+- `_rc_session_janitor()` ticks every `RC_SESSION_JANITOR_INTERVAL_S` (1 s) and
+  `_async_reap_idle_rc_sessions()` closes a device once nothing has written to
+  it for `RC_SESSION_IDLE_RELEASE_S` (8 s) and no cover movement holds it.  The
+  grace period must stay well above the relay confirmation window
+  (`_CAN_COMMAND_VERIFY_TIMEOUT_S` / `..._V1_S`): the close must never race the
+  write it exists for.
+- The janitor also starts with the CAN keepalive, so sessions owed from before a
+  reconnect are closed on the next connect, and `async_disconnect()` releases
+  everything still owed before the link goes.
+
+**Do not close a session on the command path.**  v1.0.48 did exactly that after
+relay commands and had to be reverted: the device began terminating sessions
+with reason `0x0E`, relay COMMANDs were never confirmed from DEVICE_STATUS, and
+switch state reverted a few seconds later.  Closing *after* the command has been
+confirmed, from outside the command path, avoids that.
+
+A close that fails keeps its debt and is re-stamped, so the next janitor pass
+retries after another grace period instead of spinning on a failing write.
+Closing a device that a previous command left behind does not touch the live
+session's heartbeat.
+
+### Safety timeout
+
 ## 11. Evolution Notes (Commit History)
 
 Recent trajectory includes:
