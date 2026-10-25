@@ -163,6 +163,14 @@ CONF_COVER_SAFETY_TIMEOUT = "cover_safety_timeout"
 # "tt:dd" cover key (e.g. {"0c:06": {"extend": 30.0, "retract": 28.0}}).
 # Only presented and applied while cover control is enabled.
 CONF_COVER_TRAVEL = "cover_travel"
+# Options-flow field names for one cover's travel times.  Fixed names (rather
+# than the cover key embedded in the name) so every field has a translatable
+# label; the cover being edited is named in the step description instead.
+CONF_COVER_TRAVEL_EXTEND = "extend"
+CONF_COVER_TRAVEL_RETRACT = "retract"
+# Options-flow tick box: walk the per-cover pages at all.  Not persisted — it
+# only decides whether this save visits the per-cover pages.
+CONF_CONFIGURE_COVER_TRAVEL = "configure_cover_travel"
 
 # Default cover travel time (seconds) when neither a per-cover nor a
 # per-direction override is set.  Preserves the pre-option behaviour.
@@ -176,6 +184,18 @@ DEFAULT_COVER_SAFETY_TIMEOUT = 6.0
 COVER_CEILING_MIN_PAD_S = 2.0
 COVER_CEILING_MAX_PAD_S = 5.0
 COVER_CEILING_CAP_S = 90.0
+
+# Bound on getting a cover motor STARTED (link up + REMOTE_CONTROL session +
+# first COMMAND written).  Opening the session takes anything from under a
+# second to ~3.5s on the BLE gateway, and that time must not come out of the
+# user's travel time — so the travel clock starts at the first COMMAND written
+# and this separate bound covers everything before it.
+COVER_START_TIMEOUT_S = 10.0
+
+# Hard bound on a failsafe STOP write.  The failsafe paths run precisely when
+# something already failed (possibly a hung write), so an unbounded await there
+# would keep the session release and the task teardown from ever running.
+COVER_STOP_TIMEOUT_S = 2.0
 
 GATEWAY_FAMILY_LEGACY = "legacy"
 GATEWAY_FAMILY_X180T = "x180t_can_ble"

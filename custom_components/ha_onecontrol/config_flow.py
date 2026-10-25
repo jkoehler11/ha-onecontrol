@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 import voluptuous as vol
@@ -23,8 +24,11 @@ from .const import (
     CONF_BLUETOOTH_PIN,
     CONF_ENABLE_COVER_CONTROL,
     CONF_GATEWAY_FAMILY,
+    CONF_CONFIGURE_COVER_TRAVEL,
     CONF_COVER_SAFETY_TIMEOUT,
     CONF_COVER_TRAVEL,
+    CONF_COVER_TRAVEL_EXTEND,
+    CONF_COVER_TRAVEL_RETRACT,
     CONF_GATEWAY_PIN,
     CONF_PAIRING_METHOD,
     DEFAULT_COVER_SAFETY_TIMEOUT,
@@ -46,6 +50,33 @@ _LOGGER = logging.getLogger(__name__)
 # silently default to its first option (push-to-pair), which mislabeled PIN
 # gateways that expose a Connect button but pair with a PIN.
 _PAIRING_METHOD_UNSET = "unset"
+
+
+# Optional per-cover travel-time field: blank means "use the fallback".
+# Kept module-level and built from voluptuous primitives so the form schema can
+# be serialised for the frontend — a plain Python validator cannot be.
+_COVER_TRAVEL_FIELD = vol.Any(
+    None, vol.All(vol.Coerce(float), vol.Range(min=1.0, max=60.0))
+)
+
+
+def _as_travel_seconds(value: object) -> float | None:
+    """Coerce a travel-time value to seconds, or ``None`` when it is unset.
+
+    Deliberately tolerant: values arrive both from the form and from stored
+    options, and a malformed one must fall back to the default travel time
+    rather than fail the flow.  Out-of-range values are clamped here as well as
+    in the form schema, because the stored copy is not re-validated.
+    """
+    if value is None or value == "":
+        return None
+    try:
+        seconds = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds):
+        return None
+    return max(1.0, min(60.0, seconds))
 
 
 class OneControlConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -379,6 +410,12 @@ class OneControlOptionsFlow(OptionsFlow):
 
     The actual failsafe ceiling is derived from the travel time (see the
     coordinator) and never entered by hand.
+
+    Per-cover overrides are collected one cover per form page with a fixed pair
+    of field names (``extend`` / ``retract``), so each field has a translatable
+    label and the page can name the cover it edits.  The user only walks those
+    pages when they tick the box on the first page, so changing the fallback
+    does not mean stepping through every cover.
     """
 
     def _coordinator(self) -> Any:
@@ -386,40 +423,45 @@ class OneControlOptionsFlow(OptionsFlow):
         entries = self.hass.data.get(DOMAIN, {}) if self.hass else {}
         return entries.get(self.config_entry.entry_id)
 
-    def _discovered_covers(self) -> list[tuple[str, str, int, int]]:
-        """Return discovered covers as (key, friendly name, table, device).
+    def _discovered_covers(self) -> list[tuple[str, str]]:
+        """Return discovered covers as (key, friendly name), sorted by key.
 
         Covers are only enumerable while the gateway is connected, so this may
-        be empty mid-setup; the travel step is simply skipped in that case.
+        be empty mid-setup; the per-cover step is simply skipped in that case.
         """
         coordinator = self._coordinator()
         if coordinator is None:
             return []
-        out: list[tuple[str, str, int, int]] = []
+        out: list[tuple[str, str]] = []
         for key in sorted(coordinator.covers):
             try:
                 table_s, device_s = key.split(":")
                 table_id, device_id = int(table_s, 16), int(device_s, 16)
             except ValueError:
                 continue
-            name = coordinator.device_name(table_id, device_id)
-            out.append((key, name, table_id, device_id))
+            out.append((key, coordinator.device_name(table_id, device_id)))
         return out
 
-    @staticmethod
-    def _travel_field(value: Any) -> float | None:
-        """Coerce a travel-time form field; blank/None means "use the fallback"."""
-        if value is None or value == "":
-            return None
-        try:
-            return max(1.0, min(60.0, float(value)))
-        except (TypeError, ValueError):
-            raise vol.Invalid("must be a number of seconds between 1 and 60")
+    def _existing_overrides(self) -> dict[str, dict[str, float]]:
+        """Return the stored per-cover overrides, defensively copied.
+
+        Copied rather than referenced: the flow mutates this dict as it walks
+        the covers, and it must never write through to the entry's options
+        before the user submits the last page.
+        """
+        raw = self.config_entry.options.get(CONF_COVER_TRAVEL)
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, dict[str, float]] = {}
+        for key, value in raw.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                out[key] = dict(value)
+        return out
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Manage the options: cover-control toggle + fallback travel time."""
+        """Manage the options: cover-control toggle, fallback travel time."""
         current = self.config_entry.options
 
         def _schema() -> vol.Schema:
@@ -436,23 +478,29 @@ class OneControlOptionsFlow(OptionsFlow):
                             DEFAULT_COVER_SAFETY_TIMEOUT,
                         ),
                     ): vol.All(vol.Coerce(float), vol.Range(min=1.0, max=60.0)),
+                    vol.Required(
+                        CONF_CONFIGURE_COVER_TRAVEL,
+                        default=bool(current.get(CONF_COVER_TRAVEL)),
+                    ): bool,
                 }
             )
 
         if user_input is not None:
             self._enable_cover_control = bool(user_input[CONF_ENABLE_COVER_CONTROL])
             self._fallback_travel = float(user_input[CONF_COVER_SAFETY_TIMEOUT])
-            # Preserve any previously stored per-cover overrides even when cover
-            # control is being toggled off (they only take effect when enabled),
-            # and when no covers are currently discoverable (offline gateway).
-            existing = self.config_entry.options.get(CONF_COVER_TRAVEL)
-            kept: dict[str, dict[str, float]] = {}
-            if isinstance(existing, dict):
-                kept = {k: dict(v) for k, v in existing.items() if isinstance(v, dict)}
-            if self._enable_cover_control and self._discovered_covers():
-                self._kept_overrides = kept
+            # Start from the stored overrides so covers the user does not walk
+            # through (or that are offline right now) keep their values.
+            self._travel_merged = self._existing_overrides()
+            self._travel_covers = (
+                self._discovered_covers()
+                if self._enable_cover_control
+                and bool(user_input.get(CONF_CONFIGURE_COVER_TRAVEL))
+                else []
+            )
+            self._travel_index = 0
+            if self._travel_covers:
                 return await self.async_step_travel()
-            return self._create_options(kept)
+            return self._create_options(self._travel_merged)
 
         return self.async_show_form(
             step_id="init",
@@ -462,47 +510,49 @@ class OneControlOptionsFlow(OptionsFlow):
     async def async_step_travel(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Collect optional per-cover, per-direction travel-time overrides."""
-        covers = self._discovered_covers()
-        current_overrides: dict[str, Any] = (
-            self.config_entry.options.get(CONF_COVER_TRAVEL) or {}
-        )
+        """Collect one cover's optional per-direction travel times."""
+        covers = self._travel_covers
+        index = self._travel_index
+        cover_key, cover_name = covers[index]
 
         if user_input is not None:
-            merged: dict[str, dict[str, float]] = {}
-            for cover_key, _name, _table, _device in covers:
-                entry: dict[str, float] = {}
-                ext = self._travel_field(user_input.get(f"extend_{cover_key}"))
-                ret = self._travel_field(user_input.get(f"retract_{cover_key}"))
-                if ext is not None:
-                    entry["extend"] = ext
-                if ret is not None:
-                    entry["retract"] = ret
-                if entry:
-                    merged[cover_key] = entry
-            # Carry overrides for covers not currently discovered so a temporary
-            # disconnect does not wipe them.
-            kept = getattr(self, "_kept_overrides", {})
-            for key, val in kept.items():
-                if key not in merged:
-                    merged[key] = dict(val)
-            return self._create_options(merged)
+            override: dict[str, float] = {}
+            extend = _as_travel_seconds(user_input.get(CONF_COVER_TRAVEL_EXTEND))
+            retract = _as_travel_seconds(user_input.get(CONF_COVER_TRAVEL_RETRACT))
+            if extend is not None:
+                override["extend"] = extend
+            if retract is not None:
+                override["retract"] = retract
+            if override:
+                self._travel_merged[cover_key] = override
+            else:
+                # Both blank: drop the override so the fallback applies again.
+                self._travel_merged.pop(cover_key, None)
+            self._travel_index = index + 1
+            if self._travel_index < len(covers):
+                return await self.async_step_travel()
+            return self._create_options(self._travel_merged)
 
+        previous = self._existing_overrides().get(cover_key, {})
         fields: dict[Any, Any] = {}
-        for cover_key, _name, _table, _device in covers:
-            prev = current_overrides.get(cover_key) or {}
-            fields[vol.Optional(
-                f"extend_{cover_key}",
-                default=prev.get("extend"),
-            )] = self._travel_field
-            fields[vol.Optional(
-                f"retract_{cover_key}",
-                default=prev.get("retract"),
-            )] = self._travel_field
+        for key, direction in (
+            (CONF_COVER_TRAVEL_EXTEND, "extend"),
+            (CONF_COVER_TRAVEL_RETRACT, "retract"),
+        ):
+            seconds = _as_travel_seconds(previous.get(direction))
+            if seconds is None:
+                fields[vol.Optional(key)] = _COVER_TRAVEL_FIELD
+            else:
+                fields[vol.Optional(key, default=seconds)] = _COVER_TRAVEL_FIELD
 
         return self.async_show_form(
             step_id="travel",
             data_schema=vol.Schema(fields),
+            description_placeholders={
+                "name": cover_name,
+                "index": str(index + 1),
+                "total": str(len(covers)),
+            },
         )
 
     def _create_options(self, cover_travel: dict[str, dict[str, float]]) -> ConfigFlowResult:
@@ -521,4 +571,3 @@ class OneControlOptionsFlow(OptionsFlow):
         else:
             options.pop(CONF_COVER_TRAVEL, None)
         return self.async_create_entry(data=options)
-

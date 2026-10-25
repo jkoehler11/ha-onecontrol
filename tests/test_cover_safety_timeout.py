@@ -164,3 +164,137 @@ def test_parse_cover_travel_overrides_normalises_shapes() -> None:
     assert parse({"00:06": {"extend": 30, "retract": "x"}}) == {"00:06": {"extend": 30.0}}
     assert parse({"00:06": 25}) == {"00:06": {"extend": 25.0, "retract": 25.0}}
     assert parse({123: 25}) == {}
+
+
+# ---------------------------------------------------------------------------
+# Per-cover options-flow form (multi-cover review feedback)
+#
+# Two regressions were found on a multi-cover rig and both are pinned here:
+#   * the per-cover fields were validated by a plain function, which the
+#     frontend cannot serialise ("Unable to convert schema"), so the step
+#     could not be displayed at all; and
+#   * the field names were built from the cover key ("extend_0c:06"), so no
+#     translation matched and every field rendered unlabelled.
+# ---------------------------------------------------------------------------
+
+import json
+import subprocess
+import textwrap
+
+_STRINGS = COMPONENT / "strings.json"
+_TRANSLATIONS = COMPONENT / "translations" / "en.json"
+
+
+def _travel_field_values() -> list[ast.expr]:
+    """Return the validator expressions used for the per-cover form fields."""
+    out: list[ast.expr] = []
+    for node in ast.walk(_parse("config_flow.py")):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "_COVER_TRAVEL_FIELD":
+                out.append(node.value)
+    return out
+
+
+def test_per_cover_schema_values_are_not_bare_functions() -> None:
+    """Schema validators must be voluptuous calls, not plain functions.
+
+    Home Assistant serialises the form schema to render it; a bare Python
+    function (e.g. a ``@staticmethod`` validator) raises ``Unable to convert
+    schema`` in the frontend and the step never appears.
+    """
+    values = _travel_field_values()
+    assert values, "per-cover schema fields not found in config_flow.py"
+    for value in values:
+        assert isinstance(value, ast.Call), ast.dump(value)[:200]
+        assert getattr(value.func, "attr", None) in {"Any", "All"}, ast.dump(value)[:200]
+
+
+def test_per_cover_schema_serialises_for_the_frontend() -> None:
+    """Build the per-cover validators for real and serialise them."""
+    script = textwrap.dedent(
+        """
+        import ast
+        import sys
+
+        import voluptuous as vol
+        from voluptuous_serialize import convert
+
+        tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
+        values = [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+            and target.id == "_COVER_TRAVEL_FIELD"
+        ]
+        assert values, "no per-cover schema values found"
+        for value in values:
+            validator = eval(compile(ast.fix_missing_locations(ast.Expression(body=value)), "<schema>", "eval"), {"vol": vol})
+            convert(vol.Schema({vol.Optional("field"): validator}))
+        print(len(values))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(COMPONENT / "config_flow.py")],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Unable to convert schema" not in result.stderr
+
+
+def test_per_cover_field_names_have_translations() -> None:
+    """Every per-cover field name must exist in the form translations."""
+    consts = _consts()
+    names = {
+        consts.get("CONF_COVER_TRAVEL_EXTEND"),
+        consts.get("CONF_COVER_TRAVEL_RETRACT"),
+    }
+    assert names == {"extend", "retract"}
+
+    for path in (_STRINGS, _TRANSLATIONS):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        travel = data["options"]["step"]["travel"]
+        assert set(travel["data"]) >= names, path
+        # The page names the cover instead of embedding its key in field names.
+        for placeholder in ("{name}", "{index}", "{total}"):
+            assert placeholder in travel["description"], path
+
+
+def test_per_cover_tick_box_and_merge_keys_present() -> None:
+    """The flow must offer the opt-in tick box and preserve stored overrides."""
+    consts = _consts()
+    assert consts.get("CONF_CONFIGURE_COVER_TRAVEL") == "configure_cover_travel"
+    source = (COMPONENT / "config_flow.py").read_text(encoding="utf-8")
+    assert "CONF_CONFIGURE_COVER_TRAVEL" in source
+    # Saving must merge onto the existing options (bonded_source survives).
+    assert "**self.config_entry.options" in source
+
+
+def test_failsafe_stop_and_start_are_bounded() -> None:
+    """The start phase and every failsafe STOP must run under a time bound."""
+    consts = _consts()
+    assert consts.get("COVER_START_TIMEOUT_S") == 10.0
+    assert consts.get("COVER_STOP_TIMEOUT_S") == 2.0
+
+    source = (COMPONENT / "coordinator.py").read_text(encoding="utf-8")
+    # The bound is applied in one helper; every failsafe path goes through it.
+    assert "async def _can_cover_stop_bounded" in source
+    assert "async with asyncio.timeout(COVER_STOP_TIMEOUT_S)" in source
+    # No failsafe path may call the unbounded helper directly.
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("await self._can_cover_stop("):
+            raise AssertionError(f"unbounded STOP call: {stripped}")
+
+
+def test_travel_clock_starts_at_first_command() -> None:
+    """The repeater must measure travel from the first COMMAND written."""
+    source = (COMPONENT / "coordinator.py").read_text(encoding="utf-8")
+    assert "COVER_START_TIMEOUT_S" in source
+    # Two phases: the start phase arms the clock, then the ceiling is armed.
+    assert "The motor is now energised: start the travel clock." in source
+    assert "time.monotonic() - started >= travel" in source

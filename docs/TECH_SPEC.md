@@ -327,8 +327,35 @@ are therefore kept separate:
   stops the motor.  Logging is `CAN BLE: cover safety ceiling … exceeded —
   force-stopping` (WARNING).
 
+### When the travel clock starts
+
+Travel time is measured from the **first COMMAND actually written**, not from
+the button press.  Opening the REMOTE_CONTROL session costs anything from under
+a second to ~3.5 s on the X180T, and charging that to the travel window made a
+5 s setting run ~3.6 s on one press and barely move on the next.  Each repeater
+therefore runs in two phases, both bounded from outside their loop:
+
+1. **Start** (`COVER_START_TIMEOUT_S`, 10 s) — wait for the link, ensure the
+   session, write the first COMMAND.  If the motor cannot be started inside
+   that bound, a bounded STOP is sent and the repeater exits.
+2. **Travel** — resend every `_COVER_COMMAND_REPEAT_S` until the travel time
+   has elapsed since that first COMMAND.  The derived ceiling is armed here, at
+   the first COMMAND, so it bounds the *movement* rather than press-to-stop.
+
+### Failsafe STOP is itself bounded
+
+Every STOP on a failsafe path (start-timeout, travel-complete, ceiling,
+`finally`) goes through a bounded send (`COVER_STOP_TIMEOUT_S`, 2 s).  Those
+paths run precisely when something already failed — possibly a hung BLE write —
+and an unbounded await there would stall the same way, preventing the session
+release and task teardown in `finally` from running at all.
+
+A user STOP also bumps the generation counter, so a repeater that outlives its
+cancellation exits instead of resending a direction behind the STOP.
+
 Added (2026-09-03) after a runaway awning event; reshaped (2026-10-04) to split
-travel time from the derived ceiling per multi-cover review feedback.
+travel time from the derived ceiling per multi-cover review feedback; travel
+clock and bounded failsafe (2026-10-25) after multi-cover rig testing.
 
 ## 11. Evolution Notes (Commit History)
 
