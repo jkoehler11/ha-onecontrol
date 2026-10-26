@@ -543,7 +543,13 @@ class OneControlOptionsFlow(OptionsFlow):
             if seconds is None:
                 fields[vol.Optional(key)] = _COVER_TRAVEL_FIELD
             else:
-                fields[vol.Optional(key, default=seconds)] = _COVER_TRAVEL_FIELD
+                # Pre-fill via ``suggested_value``, not ``default``: a default
+                # is applied when the frontend leaves the key out (which it
+                # does when the user empties the field), so a stored override
+                # could never be cleared.
+                fields[
+                    vol.Optional(key, description={"suggested_value": seconds})
+                ] = _COVER_TRAVEL_FIELD
 
         return self.async_show_form(
             step_id="travel",

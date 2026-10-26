@@ -183,8 +183,11 @@ def test_generation_bump_takes_over_without_stopping() -> None:
 
     assert harness.commands, "the repeater never wrote a COMMAND"
     assert harness.stops == [], "a superseded repeater must not stop the motor"
-    # ...but it still hands the device back / cleans up.
-    assert harness.closed_sessions == [(DEVICE_ID, "cover movement finished")]
+    # ...but it must NOT hand the device back: the command that took over is
+    # using that session, so closing it would force a re-open mid-movement.
+    assert harness.closed_sessions == [], (
+        "a superseded repeater closed the session the new command is using"
+    )
 
 
 def test_cancelled_repeater_does_not_write_stop_but_releases_session() -> None:

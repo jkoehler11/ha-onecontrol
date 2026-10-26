@@ -1315,12 +1315,19 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Hand the device back to the physical panel.  Scheduled rather than
             # awaited: this runs on the cancellation path too, where awaiting
             # here would be interrupted before the frame went out.
-            self.hass.async_create_background_task(
-                self._async_close_remote_control_session(
-                    device_id, "cover movement finished"
-                ),
-                name=f"ha_onecontrol_rc_close_{device_id:02x}",
-            )
+            #
+            # Skipped on a hand-off: a newer command for the same cover took
+            # over the motor and its repeater is using the session we would be
+            # closing, so releasing here would force it to re-open (up to ~3.5s
+            # of movement) — and a close landing mid-command is what the 0x0E
+            # terminations look like.
+            if not handed_off:
+                self.hass.async_create_background_task(
+                    self._async_close_remote_control_session(
+                        device_id, "cover movement finished"
+                    ),
+                    name=f"ha_onecontrol_rc_close_{device_id:02x}",
+                )
 
     async def _hbridge_cover_send(self, table_id: int, device_id: int, direction: int) -> bool:
         """Send one H-Bridge ACTION command; return True if it went out."""

@@ -274,6 +274,73 @@ def test_per_cover_tick_box_and_merge_keys_present() -> None:
     assert "**self.config_entry.options" in source
 
 
+def test_stored_override_can_be_cleared() -> None:
+    """A stored value must be offered as a suggestion, never as a default.
+
+    The frontend leaves a field's key out of ``user_input`` when the user
+    empties it, and voluptuous re-applies ``default`` in that case — so a
+    stored override could be edited but never cleared.  ``suggested_value``
+    pre-fills the box without standing in for a blank submission.
+    """
+    tree = _parse("config_flow.py")
+    travel_step = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "async_step_travel"
+    )
+    prefilled = [
+        node
+        for node in ast.walk(travel_step)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "Optional"
+        and any(kw.arg == "description" for kw in node.keywords)
+    ]
+    assert prefilled, "no suggested_value pre-fill found in async_step_travel"
+
+    for call in prefilled:
+        assert not any(kw.arg == "default" for kw in call.keywords), ast.dump(call)[:300]
+        description = next(kw.value for kw in call.keywords if kw.arg == "description")
+        assert isinstance(description, ast.Dict), ast.dump(description)[:300]
+        keys = [
+            k.value
+            for k in description.keys
+            if isinstance(k, ast.Constant) and isinstance(k.value, str)
+        ]
+        assert keys == ["suggested_value"], ast.dump(description)[:300]
+
+
+def test_handoff_keeps_the_session_the_new_command_owns() -> None:
+    """A repeater that handed the motor off must not close the session.
+
+    The newer command's repeater is using that session; closing it here would
+    force a re-open (up to ~3.5s of movement) and lands a close mid-command.
+    """
+    tree = _parse("coordinator.py")
+    repeater = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_cover_command_repeater"
+    )
+    finally_block = next(
+        node
+        for node in ast.walk(repeater)
+        if isinstance(node, ast.Try) and node.finalbody
+    )
+    guarded = [
+        node
+        for node in ast.walk(finally_block)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.UnaryOp)
+        and isinstance(node.test.operand, ast.Name)
+        and node.test.operand.id == "handed_off"
+    ]
+    assert guarded, "session release is not guarded by handed_off"
+    body = ast.unparse(guarded[0].body)
+    assert "_async_close_remote_control_session" in body, body
+
+
 def test_failsafe_stop_and_start_are_bounded() -> None:
     """The start phase and every failsafe STOP must run under a time bound."""
     consts = _consts()
