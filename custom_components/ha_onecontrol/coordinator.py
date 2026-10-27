@@ -214,6 +214,16 @@ _COVER_SAFETY_TIMEOUT_S = 6.0
 # inactivity, so we must heartbeat well under that window (observed
 # 2026-08-27: a 4s heartbeat let the session die mid-run).
 _RC_SESSION_HEARTBEAT_S = 0.5
+# How long to wait for a SESSION_REQUEST_SEED response.  The device answers
+# the preflight session queries first, so the seed routinely lands 0.2-0.5s
+# after the request (observed 2026-10-27 on a V1 gateway).  A shorter wait
+# re-requested the seed while the first answer was still in flight, and the
+# late seed was then paired with the second request: the device rejected the
+# key (KEY_NOT_CORRECT) and the relay COMMAND that followed was ignored.
+_RC_SESSION_SEED_TIMEOUT_S = 1.5
+# Pause before re-requesting a seed after a key rejection, so a straggling seed
+# response arrives (and is dropped) before the fresh request goes out.
+_RC_SESSION_RESEED_SETTLE_S = 0.5
 # Function codes for definite on/off relay loads that are NEVER dimmable or RGB.
 # Light function codes are intentionally excluded: any light can be wired as a
 # relay, dimmable, or RGB device — we cannot tell from function code alone which
@@ -511,6 +521,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._rc_session_target: int | None = None  # device_id session is open with
         self._rc_session_seed_future: asyncio.Future | None = None
         self._rc_session_key_future: asyncio.Future | None = None
+        # Device a seed/key request is waiting on; answers from others are dropped.
+        self._rc_session_expected_src: int | None = None
         self._rc_session_sid_bytes: bytes = bytes([self._RC_SESSION_ID_HI, self._RC_SESSION_ID_LO])
         self._rc_session_last_status_code: int | None = None
         self._rc_heartbeat_task: asyncio.Task | None = None
@@ -3485,6 +3497,45 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if sid not in (self._RC_SESSION_ID, 0x0400):
             return
 
+        # Seed/key answers only count when they come from the device being
+        # asked; anything else belongs to an earlier handshake.
+        expected_src = self._rc_session_expected_src
+        if (
+            msg in (0x42, 0x43)
+            and expected_src is not None
+            and wire.source_address != expected_src
+        ):
+            _LOGGER.debug(
+                "CAN BLE: ignoring session response 0x%02X from 0x%02X (waiting on 0x%02X)",
+                msg,
+                wire.source_address,
+                expected_src,
+            )
+            return
+
+        # [sid×2, status] is a rejection: a successful seed answer carries four
+        # seed bytes and a successful key answer carries none.
+        if msg in (0x42, 0x43) and len(payload) == 3 and payload[2] != 0x00:
+            status_code = payload[2]
+            self._rc_session_last_status_code = status_code
+            status_name = ids_can_response_name(status_code)
+            _LOGGER.warning(
+                "CAN BLE: session req 0x%02X rejected by device 0x%02X code=0x%02X(%s)",
+                msg,
+                wire.source_address,
+                status_code,
+                status_name,
+            )
+            err = RuntimeError(
+                f"session req 0x{msg:02X} rejected with 0x{status_code:02X}({status_name})"
+            )
+            future = (
+                self._rc_session_seed_future if msg == 0x42 else self._rc_session_key_future
+            )
+            if future is not None and not future.done():
+                future.set_exception(err)
+            return
+
         if msg == 0x42:  # SESSION_REQUEST_SEED response — payload: [sid×2, seed×4]
             # Accept responses with at least 3 bytes (sid + at least 1 seed byte).
             # Some devices send truncated seed responses; pad with zeros if needed.
@@ -3547,16 +3598,75 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
 
         elif msg in (0x44, 0x45):  # Device closing the session (heartbeat close / session end)
-            if len(payload) >= 3:
-                reason = payload[2]
+            reason = payload[2] if len(payload) >= 3 else None
+            current = self._rc_session_target
+            if current is not None and wire.source_address != current:
+                # An earlier session on another device timing out must not
+                # tear down (and stop heartbeating) the session in use now.
                 _LOGGER.info(
-                    "CAN BLE: REMOTE_CONTROL session terminated by device, reason=0x%02X", reason
+                    "CAN BLE: earlier REMOTE_CONTROL session on device 0x%02X ended, reason=%s",
+                    wire.source_address,
+                    "n/a" if reason is None else f"0x{reason:02X}",
+                )
+                return
+            if reason is not None:
+                _LOGGER.info(
+                    "CAN BLE: REMOTE_CONTROL session terminated by device 0x%02X, reason=0x%02X",
+                    wire.source_address,
+                    reason,
                 )
             self._rc_session_open = False
             self._rc_session_target = None
             self._rc_session_sid_bytes = bytes([self._RC_SESSION_ID_HI, self._RC_SESSION_ID_LO])
             if self._rc_heartbeat_task and not self._rc_heartbeat_task.done():
                 self._rc_heartbeat_task.cancel()
+
+    async def _request_session_seed(
+        self, client: BleakClient, src: int, dst: int, sid_bytes: bytes
+    ) -> int | None:
+        """Send one SESSION_REQUEST_SEED and return the seed, or None."""
+        seed_req = compose_ids_can_extended_wire_frame(
+            message_type=0x80,
+            source_address=src,
+            target_address=dst,
+            message_data=0x42,  # SESSION_REQUEST_SEED
+            payload=sid_bytes,
+        )
+        self._rc_session_seed_future = asyncio.get_running_loop().create_future()
+        self._rc_session_expected_src = dst
+        try:
+            _LOGGER.debug(
+                "CAN BLE: SESSION_REQUEST_SEED tx src=0x%02X dst=0x%02X sid=%s frame=%s",
+                src,
+                dst,
+                sid_bytes.hex(),
+                seed_req.hex(),
+            )
+            await self._write_can_frame(client, seed_req, label="SESSION_REQUEST_SEED")
+            return await asyncio.wait_for(
+                asyncio.shield(self._rc_session_seed_future),
+                timeout=_RC_SESSION_SEED_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.debug(
+                "CAN BLE: SESSION_REQUEST_SEED timeout for src=0x%02X dst=0x%02X sid=%s",
+                src,
+                dst,
+                sid_bytes.hex(),
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning(
+                "CAN BLE: SESSION_REQUEST_SEED error for src=0x%02X dst=0x%02X sid=%s: %s",
+                src,
+                dst,
+                sid_bytes.hex(),
+                exc,
+            )
+            return None
+        finally:
+            self._rc_session_seed_future = None
+            self._rc_session_expected_src = None
 
     async def _ensure_remote_control_session(
         self, client: BleakClient, device_id: int
@@ -3665,49 +3775,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 for dst in target_candidates:
                     for sid_bytes in sid_candidates:
                         for src in source_candidates:
-                            seed_req = compose_ids_can_extended_wire_frame(
-                                message_type=0x80,
-                                source_address=src,
-                                target_address=dst,
-                                message_data=0x42,  # SESSION_REQUEST_SEED
-                                payload=sid_bytes,
-                            )
-                            self._rc_session_seed_future = loop.create_future()
-                            try:
-                                _LOGGER.debug(
-                                    "CAN BLE: SESSION_REQUEST_SEED tx src=0x%02X dst=0x%02X sid=%s frame=%s",
-                                    src,
-                                    dst,
-                                    sid_bytes.hex(),
-                                    seed_req.hex(),
-                                )
-                                await self._write_can_frame(client, seed_req, label="SESSION_REQUEST_SEED")
-                                seed = await asyncio.wait_for(
-                                    asyncio.shield(self._rc_session_seed_future), timeout=0.45
-                                )
+                            seed = await self._request_session_seed(client, src, dst, sid_bytes)
+                            if seed is not None:
                                 selected_source = src
                                 selected_target = dst
                                 selected_sid_bytes = sid_bytes
                                 break
-                            except asyncio.TimeoutError:
-                                _LOGGER.debug(
-                                    "CAN BLE: SESSION_REQUEST_SEED timeout for src=0x%02X dst=0x%02X sid=%s",
-                                    src,
-                                    dst,
-                                    sid_bytes.hex(),
-                                )
-                                continue
-                            except Exception as exc:
-                                _LOGGER.warning(
-                                    "CAN BLE: SESSION_REQUEST_SEED error for src=0x%02X dst=0x%02X sid=%s: %s",
-                                    src,
-                                    dst,
-                                    sid_bytes.hex(),
-                                    exc,
-                                )
-                                continue
-                            finally:
-                                self._rc_session_seed_future = None
                         if selected_source is not None:
                             break
                     if selected_source is not None:
@@ -3749,44 +3822,68 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._gateway_can_address = selected_source
 
             # ── Step 2: encrypt seed, transmit key ────────────────
-            key = tea_encrypt(RC_CYPHER, seed)
-            key_req = compose_ids_can_extended_wire_frame(
-                message_type=0x80,
-                source_address=selected_source,
-                target_address=selected_target,
-                message_data=0x43,  # SESSION_TRANSMIT_KEY
-                payload=self._rc_session_sid_bytes + key.to_bytes(4, "big"),
-            )
-            self._rc_session_key_future = loop.create_future()
-            try:
-                _LOGGER.debug(
-                    "CAN BLE: SESSION_TRANSMIT_KEY tx src=0x%02X dst=0x%02X frame=%s",
-                    selected_source,
-                    device_id,
-                    key_req.hex(),
-                )
-                await self._write_can_frame(client, key_req, label="SESSION_TRANSMIT_KEY")
-                await asyncio.wait_for(
-                    asyncio.shield(self._rc_session_key_future), timeout=3.0
-                )
-            except asyncio.TimeoutError:
-                _LOGGER.warning("CAN BLE: REMOTE_CONTROL session key timed out for device 0x%02X", device_id)
-                self._rc_session_key_future = None
-                return False
-            except Exception as exc:
-                if self._rc_session_last_status_code is not None:
-                    _LOGGER.warning(
-                        "CAN BLE: REMOTE_CONTROL session key rejected for device 0x%02X status=0x%02X(%s)",
-                        device_id,
-                        self._rc_session_last_status_code,
-                        ids_can_response_name(self._rc_session_last_status_code),
+            # A key built from a stale seed is rejected with KEY_NOT_CORRECT;
+            # recover once with a fresh seed instead of carrying on without a
+            # session (the device then ignores the COMMAND).
+            for key_attempt in range(2):
+                if key_attempt:
+                    await asyncio.sleep(_RC_SESSION_RESEED_SETTLE_S)
+                    seed = await self._request_session_seed(
+                        client, selected_source, selected_target, selected_sid_bytes
                     )
-                else:
-                    _LOGGER.warning("CAN BLE: REMOTE_CONTROL session key error: %s", exc)
-                self._rc_session_key_future = None
-                return False
-            finally:
-                self._rc_session_key_future = None
+                    if seed is None:
+                        _LOGGER.warning(
+                            "CAN BLE: REMOTE_CONTROL re-seed failed for device 0x%02X",
+                            device_id,
+                        )
+                        return False
+                key = tea_encrypt(RC_CYPHER, seed)
+                key_req = compose_ids_can_extended_wire_frame(
+                    message_type=0x80,
+                    source_address=selected_source,
+                    target_address=selected_target,
+                    message_data=0x43,  # SESSION_TRANSMIT_KEY
+                    payload=self._rc_session_sid_bytes + key.to_bytes(4, "big"),
+                )
+                self._rc_session_last_status_code = None
+                self._rc_session_key_future = loop.create_future()
+                self._rc_session_expected_src = selected_target
+                try:
+                    _LOGGER.debug(
+                        "CAN BLE: SESSION_TRANSMIT_KEY tx src=0x%02X dst=0x%02X frame=%s",
+                        selected_source,
+                        device_id,
+                        key_req.hex(),
+                    )
+                    await self._write_can_frame(client, key_req, label="SESSION_TRANSMIT_KEY")
+                    await asyncio.wait_for(
+                        asyncio.shield(self._rc_session_key_future), timeout=3.0
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("CAN BLE: REMOTE_CONTROL session key timed out for device 0x%02X", device_id)
+                    return False
+                except Exception as exc:
+                    status = self._rc_session_last_status_code
+                    if status == 0x0D and key_attempt == 0:
+                        _LOGGER.warning(
+                            "CAN BLE: REMOTE_CONTROL key rejected (KEY_NOT_CORRECT) for device 0x%02X; requesting a fresh seed",
+                            device_id,
+                        )
+                        continue
+                    if status is not None:
+                        _LOGGER.warning(
+                            "CAN BLE: REMOTE_CONTROL session key rejected for device 0x%02X status=0x%02X(%s)",
+                            device_id,
+                            status,
+                            ids_can_response_name(status),
+                        )
+                    else:
+                        _LOGGER.warning("CAN BLE: REMOTE_CONTROL session key error: %s", exc)
+                    return False
+                finally:
+                    self._rc_session_key_future = None
+                    self._rc_session_expected_src = None
 
             self._rc_session_open = True
             self._rc_session_target = device_id
