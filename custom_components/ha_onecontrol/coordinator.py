@@ -558,6 +558,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # sessions are released as soon as the write is known to have landed,
         # instead of after the longer unconfirmed grace.
         self._rc_session_confirmed: set[int] = set()
+        # Devices whose COMMAND is still inside its verification window (retry
+        # included).  The janitor must not release these: the unconfirmed grace
+        # is shorter than the V1 verify window, so a release there would race
+        # the confirmation the session exists for.
+        self._rc_session_awaiting_confirmation: set[int] = set()
         self._rc_janitor_task: asyncio.Task | None = None
         self._can_time_source: int | None = None
         # Source address used by official app host-side IDS-CAN requests.
@@ -923,6 +928,9 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._can_ble_gateway_version,
                 frame.hex(),
             )
+            # Hold the session for the whole verification window, retry
+            # included: the unconfirmed grace is shorter than the V1 window.
+            self._rc_session_awaiting_confirmation.add(device_id)
             try:
                 verify_timeout = self._can_command_verify_timeout()
                 # Stamp BEFORE the write: the janitor must never act on the
@@ -969,6 +977,8 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
             except BleakError as exc:
                 _LOGGER.warning("CAN BLE: relay COMMAND failed: %s", exc)
+            finally:
+                self._rc_session_awaiting_confirmation.discard(device_id)
         else:
             frame = compose_ids_can_extended_wire_frame(
                 message_type=0x82,
@@ -4376,6 +4386,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # A cover movement holds the session for its whole travel window.
             if self._cover_movement_active(device_id):
                 continue
+            # A COMMAND still waiting for its feedback (or its retry) holds it
+            # too: the unconfirmed grace is shorter than the V1 verify window.
+            if device_id in self._rc_session_awaiting_confirmation:
+                continue
             grace = (
                 RC_SESSION_CONFIRMED_RELEASE_S
                 if device_id in self._rc_session_confirmed
@@ -4446,6 +4460,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         target = device_id if device_id is not None else self._rc_session_target
         if target is None:
             return
+        self._rc_session_awaiting_confirmation.discard(target)
 
         client = self._client
         sid_bytes = self._rc_session_sid_bytes

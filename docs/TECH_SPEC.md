@@ -399,6 +399,12 @@ is released by a **janitor**, not on the command path:
   of this fix did exactly that, and users read it as a 3–5 s lag.  Confirmation
   itself does not need the session: DEVICE_STATUS broadcast frames arrive
   regardless of who holds it.
+- A device with a COMMAND still waiting for its feedback is not reaped either.
+  `_rc_session_awaiting_confirmation` is set before the write and cleared when
+  the verification window — first attempt and retry — is over; the janitor skips
+  those devices.  The unconfirmed grace (2 s) is shorter than the V1 relay verify
+  window (5 s), so without this the release could race the confirmation the
+  session exists for.  Releasing a device clears any claim it still holds.
 - The janitor also starts with the CAN keepalive, so sessions owed from before a
   reconnect are closed on the next connect, and `async_disconnect()` releases
   everything still owed before the link goes.  That teardown sweep is bounded

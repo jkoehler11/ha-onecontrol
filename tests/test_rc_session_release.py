@@ -63,6 +63,7 @@ class SessionHarness:
         c._rc_session_sid_bytes = bytes([0x00, 0x04])
         c._rc_session_dirty = {IDLE_DEVICE: time.monotonic()}
         c._rc_session_confirmed = set()
+        c._rc_session_awaiting_confirmation = set()
         c._rc_janitor_task = None
         c._rc_heartbeat_task = None
         c._cover_command_tasks = {}
@@ -457,3 +458,116 @@ def test_relay_command_is_stamped_before_the_write() -> None:
     assert stamped == [True], (
         "the COMMAND was written before its session was stamped"
     )
+
+
+def test_janitor_waits_for_an_outstanding_command() -> None:
+    """A COMMAND inside its verify window owns the session, retry included.
+
+    The unconfirmed grace (2 s) is shorter than the V1 relay verify window
+    (5 s), so without this the janitor can release the session while the
+    COMMAND is still waiting for DEVICE_STATUS — exactly the race the release
+    is supposed to stay out of.
+    """
+
+    async def scenario() -> SessionHarness:
+        harness = SessionHarness()
+        _install_writer(harness)
+        harness.c._rc_session_dirty = {IDLE_DEVICE: time.monotonic() - 60.0}
+        harness.c._rc_session_awaiting_confirmation = {IDLE_DEVICE}
+        await harness.c._async_reap_idle_rc_sessions()
+        return harness
+
+    harness = asyncio.run(scenario())
+
+    assert harness.closes() == [], "the janitor released a session mid-verify"
+    assert IDLE_DEVICE in harness.c._rc_session_dirty
+    assert harness.c._rc_session_open is True
+
+
+def _pending_probe(harness: "SessionHarness", seen: list[bool], *, results: list[bool]) -> Any:
+    """Return a ``_wait_for_can_relay_state`` fake recording the claim state."""
+
+    async def _wait(device_id: int, state: bool, *, timeout: float) -> bool:
+        seen.append(device_id in harness.c._rc_session_awaiting_confirmation)
+        return results.pop(0)
+
+    return _wait
+
+
+def _relay_harness(harness: "SessionHarness") -> None:
+    """Wire a SessionHarness up for ``async_can_switch`` (deps only)."""
+
+    async def _advertise(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def _ensure(client: Any, device_id: int) -> bool:
+        harness.c._rc_session_open = True
+        harness.c._rc_session_target = device_id
+        return True
+
+    harness.c._advertise_can_local_host_identity = _advertise
+    harness.c._ensure_remote_control_session = _ensure
+    harness.c._can_ble_gateway_version = "Unknown"
+    harness.c.relays = {}
+    harness.c._is_can_ble_v1_gateway = lambda: False
+
+
+def test_relay_command_holds_the_session_through_the_verify_window() -> None:
+    """The session is held while the COMMAND waits, and released after."""
+
+    async def scenario() -> tuple[list[bool], SessionHarness]:
+        harness = SessionHarness()
+        _install_writer(harness)
+        pending_during_wait: list[bool] = []
+        _relay_harness(harness)
+        harness.c._wait_for_can_relay_state = _pending_probe(
+            harness, pending_during_wait, results=[True]
+        )
+        await harness.c.async_can_switch(IDLE_DEVICE, True)
+        return pending_during_wait, harness
+
+    pending_during_wait, harness = asyncio.run(scenario())
+
+    assert pending_during_wait == [True], (
+        "the janitor was free to reap the session during the verify window"
+    )
+    assert IDLE_DEVICE not in harness.c._rc_session_awaiting_confirmation, (
+        "the confirmation claim outlived the verify window"
+    )
+
+
+def test_relay_retry_also_holds_the_session() -> None:
+    """The retry's verify wait is covered too, not just the first one."""
+
+    async def scenario() -> tuple[list[bool], SessionHarness]:
+        harness = SessionHarness()
+        _install_writer(harness)
+        pending_during_wait: list[bool] = []
+        _relay_harness(harness)
+        harness.c._wait_for_can_relay_state = _pending_probe(
+            harness, pending_during_wait, results=[False, True]
+        )
+        await harness.c.async_can_switch(IDLE_DEVICE, True)
+        return pending_during_wait, harness
+
+    pending_during_wait, harness = asyncio.run(scenario())
+
+    assert pending_during_wait == [True, True], (
+        f"a verify wait ran without the claim: {pending_during_wait}"
+    )
+    assert IDLE_DEVICE not in harness.c._rc_session_awaiting_confirmation
+
+
+def test_closing_clears_a_stale_confirmation_claim() -> None:
+    """A release must drop any claim, so it can never block later reaps."""
+
+    async def scenario() -> SessionHarness:
+        harness = SessionHarness()
+        _install_writer(harness)
+        harness.c._rc_session_awaiting_confirmation = {IDLE_DEVICE}
+        await harness.c._async_close_remote_control_session(IDLE_DEVICE, "test")
+        return harness
+
+    harness = asyncio.run(scenario())
+
+    assert IDLE_DEVICE not in harness.c._rc_session_awaiting_confirmation
