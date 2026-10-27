@@ -3795,8 +3795,10 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 or seed is None
             ):
                 if v1_gateway:
+                    busy = self._rc_session_last_status_code == 0x0B
                     _LOGGER.warning(
-                        "CAN BLE: explicit REMOTE_CONTROL seed timed out on V1/24955 device 0x%02X after LocalHost identity (src=%s dst=%s); falling back to official auto-session wrapper",
+                        "CAN BLE: explicit REMOTE_CONTROL seed %s on V1/24955 device 0x%02X after LocalHost identity (src=%s dst=%s); falling back to official auto-session wrapper",
+                        "refused (device busy)" if busy else "timed out",
                         device_id,
                         ",".join(f"0x{s:02X}" for s in source_candidates),
                         ",".join(f"0x{d:02X}" for d in target_candidates),
