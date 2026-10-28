@@ -400,11 +400,23 @@ is released by a **janitor**, not on the command path:
   itself does not need the session: DEVICE_STATUS broadcast frames arrive
   regardless of who holds it.
 - A device with a COMMAND still waiting for its feedback is not reaped either.
-  `_rc_session_awaiting_confirmation` is set before the write and cleared when
-  the verification window — first attempt and retry — is over; the janitor skips
-  those devices.  The unconfirmed grace (2 s) is shorter than the V1 relay verify
-  window (5 s), so without this the release could race the confirmation the
-  session exists for.  Releasing a device clears any claim it still holds.
+  `_rc_session_awaiting_confirmation` counts the commands claiming a device
+  (`_claim_rc_session()` / `_release_rc_session_claim()`) and the janitor skips
+  anything with a claim.  It is taken **before** `_ensure_remote_control_session`
+  and dropped when the verification window — first attempt and retry — is over.
+  The unconfirmed grace (2 s) is shorter than the V1 relay verify window (5 s),
+  so without this the release could race the confirmation the session exists
+  for.  It is a count rather than a flag because a second toggle can start
+  inside the first one's window; a flag would let the first one finishing
+  release the claim the second still needs.  Releasing a device clears any
+  claim it still holds.
+- The janitor decides and closes under one lock.  On a V1 gateway the seed/key
+  handshake holds `_rc_session_lock` for about a second, so a janitor that
+  decided to reap before taking the lock could get it after a re-toggle had
+  already claimed the device and written its COMMAND — and send `0x45` right
+  behind that write.  `_async_reap_idle_rc_sessions()` therefore checks its skip
+  conditions before the lock (cheap rejection) **and again while holding it**,
+  then calls `_async_close_rc_session_locked()`.
 - The janitor also starts with the CAN keepalive, so sessions owed from before a
   reconnect are closed on the next connect, and `async_disconnect()` releases
   everything still owed before the link goes.  That teardown sweep is bounded

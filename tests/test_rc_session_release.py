@@ -63,7 +63,7 @@ class SessionHarness:
         c._rc_session_sid_bytes = bytes([0x00, 0x04])
         c._rc_session_dirty = {IDLE_DEVICE: time.monotonic()}
         c._rc_session_confirmed = set()
-        c._rc_session_awaiting_confirmation = set()
+        c._rc_session_awaiting_confirmation = {}
         c._rc_janitor_task = None
         c._rc_heartbeat_task = None
         c._cover_command_tasks = {}
@@ -473,7 +473,7 @@ def test_janitor_waits_for_an_outstanding_command() -> None:
         harness = SessionHarness()
         _install_writer(harness)
         harness.c._rc_session_dirty = {IDLE_DEVICE: time.monotonic() - 60.0}
-        harness.c._rc_session_awaiting_confirmation = {IDLE_DEVICE}
+        harness.c._claim_rc_session(IDLE_DEVICE)
         await harness.c._async_reap_idle_rc_sessions()
         return harness
 
@@ -564,10 +564,130 @@ def test_closing_clears_a_stale_confirmation_claim() -> None:
     async def scenario() -> SessionHarness:
         harness = SessionHarness()
         _install_writer(harness)
-        harness.c._rc_session_awaiting_confirmation = {IDLE_DEVICE}
+        harness.c._claim_rc_session(IDLE_DEVICE)
         await harness.c._async_close_remote_control_session(IDLE_DEVICE, "test")
         return harness
 
     harness = asyncio.run(scenario())
 
     assert IDLE_DEVICE not in harness.c._rc_session_awaiting_confirmation
+
+
+def test_claim_is_taken_before_the_session_handshake() -> None:
+    """The claim must be visible before ``_ensure_remote_control_session``.
+
+    The handshake holds ``_rc_session_lock`` for about a second on V1 gateways.
+    A janitor that decided to reap the previous session is queued on that lock,
+    so the claim has to be in place before the handshake starts, not after it —
+    otherwise the janitor gets the lock, finds no claim, and closes right behind
+    the COMMAND that just went out.
+    """
+
+    async def scenario() -> list[bool]:
+        harness = SessionHarness()
+        _install_writer(harness)
+        _relay_harness(harness)
+        claimed_at_handshake: list[bool] = []
+
+        async def _ensure(client: Any, device_id: int) -> bool:
+            claimed_at_handshake.append(
+                device_id in harness.c._rc_session_awaiting_confirmation
+            )
+            harness.c._rc_session_open = True
+            harness.c._rc_session_target = device_id
+            return True
+
+        async def _confirmed(device_id: int, state: bool, *, timeout: float) -> bool:
+            return True
+
+        harness.c._ensure_remote_control_session = _ensure
+        harness.c._wait_for_can_relay_state = _confirmed
+
+        await harness.c.async_can_switch(IDLE_DEVICE, True)
+        return claimed_at_handshake
+
+    assert asyncio.run(scenario()) == [True], (
+        "the session was not claimed before the handshake"
+    )
+
+
+def test_janitor_rechecks_under_the_lock() -> None:
+    """A command that claims the device while the janitor waits is not reaped.
+
+    Reproduces the V1 re-toggle: the janitor's pre-check passes, the handshake
+    holds the lock, a command claims the device, and then the janitor gets the
+    lock.  It has to look again before closing.
+    """
+
+    async def scenario() -> tuple[SessionHarness, list[str]]:
+        harness = SessionHarness()
+        _install_writer(harness)
+        harness.c._rc_session_dirty = {IDLE_DEVICE: time.monotonic() - 60.0}
+        order: list[str] = []
+
+        async def _janitor() -> None:
+            await harness.c._async_reap_idle_rc_sessions()
+            order.append("janitor")
+
+        # Stand in for the handshake holding the lock, then let the janitor
+        # queue on it while a command claims the device.
+        await harness.c._rc_session_lock.acquire()
+        try:
+            janitor = asyncio.ensure_future(_janitor())
+            await asyncio.sleep(0.05)
+            harness.c._claim_rc_session(IDLE_DEVICE)
+            order.append("claim")
+        finally:
+            harness.c._rc_session_lock.release()
+        await janitor
+        return harness, order
+
+    harness, order = asyncio.run(scenario())
+
+    assert order == ["claim", "janitor"], f"the janitor did not wait on the lock: {order}"
+    assert harness.closes() == [], "the janitor closed a session a command had claimed"
+    assert IDLE_DEVICE in harness.c._rc_session_dirty
+
+
+def test_overlapping_commands_hold_the_claim_until_the_last_one_finishes() -> None:
+    """Two commands to one device: the first to finish must not clear the claim."""
+
+    async def scenario() -> tuple[SessionHarness, int | None, int | None, int | None]:
+        harness = SessionHarness()
+        _install_writer(harness)
+        _relay_harness(harness)
+
+        gates = [asyncio.Event(), asyncio.Event()]
+        entered = 0
+
+        async def _wait(device_id: int, state: bool, *, timeout: float) -> bool:
+            nonlocal entered
+            gate = gates[min(entered, 1)]
+            entered += 1
+            await gate.wait()
+            return True
+
+        harness.c._wait_for_can_relay_state = _wait
+        tasks = [
+            asyncio.ensure_future(harness.c.async_can_switch(IDLE_DEVICE, True)),
+            asyncio.ensure_future(harness.c.async_can_switch(IDLE_DEVICE, False)),
+        ]
+        while entered < 2:
+            await asyncio.sleep(0.01)
+        both_held = harness.c._rc_session_awaiting_confirmation.get(IDLE_DEVICE)
+
+        gates[0].set()
+        await tasks[0]
+        one_left = harness.c._rc_session_awaiting_confirmation.get(IDLE_DEVICE)
+
+        gates[1].set()
+        await tasks[1]
+        after = harness.c._rc_session_awaiting_confirmation.get(IDLE_DEVICE)
+        return harness, both_held, one_left, after
+
+    harness, both_held, one_left, after = asyncio.run(scenario())
+
+    assert both_held == 2, f"the second command did not add its own claim: {both_held}"
+    assert one_left == 1, "the first command to finish cleared the second one's claim"
+    assert after is None, "the claim outlived the last command"
+    assert harness.c._rc_session_awaiting_confirmation == {}

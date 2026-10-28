@@ -74,7 +74,7 @@ class RepeaterHarness:
         # Session-release bookkeeping the COMMAND paths touch.
         c._rc_session_dirty = {}
         c._rc_session_confirmed = set()
-        c._rc_session_awaiting_confirmation = set()
+        c._rc_session_awaiting_confirmation = {}
         c._rc_janitor_task = None
         c._gateway_can_address = GATEWAY_ADDRESS
         c.hass = _FakeHass()

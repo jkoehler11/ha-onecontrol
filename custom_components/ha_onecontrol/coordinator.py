@@ -559,10 +559,12 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # instead of after the longer unconfirmed grace.
         self._rc_session_confirmed: set[int] = set()
         # Devices whose COMMAND is still inside its verification window (retry
-        # included).  The janitor must not release these: the unconfirmed grace
-        # is shorter than the V1 verify window, so a release there would race
-        # the confirmation the session exists for.
-        self._rc_session_awaiting_confirmation: set[int] = set()
+        # included), with the number of commands currently claiming them.  The
+        # janitor must not release these: the unconfirmed grace is shorter than
+        # the V1 verify window, so a release there would race the confirmation
+        # the session exists for.  Counted rather than flagged, because a second
+        # toggle can start before the first one's window closes.
+        self._rc_session_awaiting_confirmation: dict[int, int] = {}
         self._rc_janitor_task: asyncio.Task | None = None
         self._can_time_source: int | None = None
         # Source address used by official app host-side IDS-CAN requests.
@@ -896,42 +898,48 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         the command is queued and sent at the start of the next connection window.
         """
         if self._client and self._connected and self._can_read_subscribed:
-            await self._advertise_can_local_host_identity(
-                self._client, reason="pre-command", force=True
-            )
-            # Official command runner activates REMOTE_CONTROL first.  Even
-            # for observed V1/24955 gateways, Type2 relays require explicit
-            # session seed/key before accepting COMMAND frames from HA.
-            session_ok = await self._ensure_remote_control_session(self._client, device_id)
-            if not session_ok:
-                _LOGGER.warning(
-                    "CAN BLE: relay COMMAND skipped — REMOTE_CONTROL activation failed for device=0x%02X gateway_version=%s",
-                    device_id,
-                    self._can_ble_gateway_version,
-                )
-                return
-
-            # RelayBasicLatching Type2 parity: command byte goes in message_data
-            # (0x01=ON, 0x00=OFF), payload is empty, source is current LocalHost.
-            frame = compose_ids_can_extended_wire_frame(
-                message_type=0x82,   # COMMAND
-                source_address=self._gateway_can_address,
-                target_address=device_id,
-                message_data=0x01 if state else 0x00,
-                payload=b"",
-            )
-            _LOGGER.info(
-                "CAN BLE: relay COMMAND device=0x%02X src=0x%02X state=%s gateway_version=%s frame=%s",
-                device_id,
-                self._gateway_can_address,
-                "ON" if state else "OFF",
-                self._can_ble_gateway_version,
-                frame.hex(),
-            )
-            # Hold the session for the whole verification window, retry
-            # included: the unconfirmed grace is shorter than the V1 window.
-            self._rc_session_awaiting_confirmation.add(device_id)
+            # Claim the device BEFORE the session handshake.  The handshake
+            # holds ``_rc_session_lock`` for about a second on V1 gateways, and
+            # a janitor that decided to reap the previous session is queued on
+            # that lock.  Claiming first means its re-check under the lock sees
+            # this COMMAND and leaves the session alone, instead of sending
+            # 0x45 right behind this write.
+            self._claim_rc_session(device_id)
             try:
+                await self._advertise_can_local_host_identity(
+                    self._client, reason="pre-command", force=True
+                )
+                # Official command runner activates REMOTE_CONTROL first.  Even
+                # for observed V1/24955 gateways, Type2 relays require explicit
+                # session seed/key before accepting COMMAND frames from HA.
+                session_ok = await self._ensure_remote_control_session(self._client, device_id)
+                if not session_ok:
+                    _LOGGER.warning(
+                        "CAN BLE: relay COMMAND skipped — REMOTE_CONTROL activation failed for device=0x%02X gateway_version=%s",
+                        device_id,
+                        self._can_ble_gateway_version,
+                    )
+                    return
+
+                # RelayBasicLatching Type2 parity: command byte goes in message_data
+                # (0x01=ON, 0x00=OFF), payload is empty, source is current LocalHost.
+                frame = compose_ids_can_extended_wire_frame(
+                    message_type=0x82,   # COMMAND
+                    source_address=self._gateway_can_address,
+                    target_address=device_id,
+                    message_data=0x01 if state else 0x00,
+                    payload=b"",
+                )
+                _LOGGER.info(
+                    "CAN BLE: relay COMMAND device=0x%02X src=0x%02X state=%s gateway_version=%s frame=%s",
+                    device_id,
+                    self._gateway_can_address,
+                    "ON" if state else "OFF",
+                    self._can_ble_gateway_version,
+                    frame.hex(),
+                )
+                # Hold the session for the whole verification window, retry
+                # included: the unconfirmed grace is shorter than the V1 window.
                 verify_timeout = self._can_command_verify_timeout()
                 # Stamp BEFORE the write: the janitor must never act on the
                 # previous command's grace while this write is in flight, and a
@@ -978,7 +986,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except BleakError as exc:
                 _LOGGER.warning("CAN BLE: relay COMMAND failed: %s", exc)
             finally:
-                self._rc_session_awaiting_confirmation.discard(device_id)
+                self._release_rc_session_claim(device_id)
         else:
             frame = compose_ids_can_extended_wire_frame(
                 message_type=0x82,
@@ -4329,6 +4337,27 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # A fresh COMMAND is unconfirmed until its own feedback arrives.
             self._rc_session_confirmed.discard(device_id)
 
+    def _claim_rc_session(self, device_id: int) -> None:
+        """Note that a COMMAND for *device_id* is about to be sent.
+
+        Taken BEFORE the session handshake, because the handshake holds
+        ``_rc_session_lock`` and a janitor waiting on that lock has already
+        decided to reap.  The claim is counted, not flagged: a second command to
+        the same device can start inside the first one's verify window, and the
+        first one finishing must not release the claim the second still holds.
+        """
+        self._rc_session_awaiting_confirmation[device_id] = (
+            self._rc_session_awaiting_confirmation.get(device_id, 0) + 1
+        )
+
+    def _release_rc_session_claim(self, device_id: int) -> None:
+        """Drop one claim on *device_id*; the last one clears the entry."""
+        count = self._rc_session_awaiting_confirmation.get(device_id, 0)
+        if count <= 1:
+            self._rc_session_awaiting_confirmation.pop(device_id, None)
+        else:
+            self._rc_session_awaiting_confirmation[device_id] = count - 1
+
     def _mark_rc_session_confirmed(self, device_id: int) -> None:
         """Note that DEVICE_STATUS confirmed the COMMAND for *device_id*.
 
@@ -4378,28 +4407,46 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             pass
 
     async def _async_reap_idle_rc_sessions(self) -> None:
-        """Close sessions that are idle and not owned by a cover movement."""
+        """Close sessions that are idle and not owned by a cover movement.
+
+        The skip conditions are checked twice: once before taking the lock, so
+        an obviously busy device costs nothing, and again while holding it.  The
+        second check is the one that matters — the seed/key handshake holds this
+        lock for about a second on V1 gateways, so a command can start, claim the
+        device and write its COMMAND while the janitor is queued behind that
+        handshake.  Deciding before the lock and closing after it would put the
+        close right behind that write.
+        """
         if not self._rc_session_dirty:
             return
-        now = time.monotonic()
-        for device_id, last_command in list(self._rc_session_dirty.items()):
-            # A cover movement holds the session for its whole travel window.
-            if self._cover_movement_active(device_id):
+        for device_id in list(self._rc_session_dirty):
+            if not self._rc_session_reapable(device_id):
                 continue
-            # A COMMAND still waiting for its feedback (or its retry) holds it
-            # too: the unconfirmed grace is shorter than the V1 verify window.
-            if device_id in self._rc_session_awaiting_confirmation:
-                continue
-            grace = (
-                RC_SESSION_CONFIRMED_RELEASE_S
-                if device_id in self._rc_session_confirmed
-                else RC_SESSION_IDLE_RELEASE_S
-            )
-            if now - last_command < grace:
-                continue
-            await self._async_close_remote_control_session(
-                device_id, "idle since last command"
-            )
+            async with self._rc_session_lock:
+                if not self._rc_session_reapable(device_id):
+                    continue
+                await self._async_close_rc_session_locked(
+                    device_id, "idle since last command"
+                )
+
+    def _rc_session_reapable(self, device_id: int) -> bool:
+        """Return True if *device_id*'s session may be released right now."""
+        # A cover movement holds the session for its whole travel window.
+        if self._cover_movement_active(device_id):
+            return False
+        # A COMMAND still waiting for its feedback (or its retry) holds it too:
+        # the unconfirmed grace is shorter than the V1 verify window.
+        if self._rc_session_awaiting_confirmation.get(device_id, 0):
+            return False
+        last_command = self._rc_session_dirty.get(device_id)
+        if last_command is None:
+            return False
+        grace = (
+            RC_SESSION_CONFIRMED_RELEASE_S
+            if device_id in self._rc_session_confirmed
+            else RC_SESSION_IDLE_RELEASE_S
+        )
+        return time.monotonic() - last_command >= grace
 
     def _cover_movement_active(self, device_id: int) -> bool:
         """Return True if a running cover movement owns *device_id*.
@@ -4445,10 +4492,11 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Mirrors the official client's CloseSession: REQUEST 0x45 carrying the
         two session-id bytes.
 
-        Only called when a cover movement ends.  Closing after *relay* commands
-        was tried in 1.0.48 and reverted: the device began terminating sessions
-        with reason 0x0E and relay COMMANDs stopped being confirmed, so lights
-        reverted a few seconds after each change.
+        Called when a cover movement ends, and by the janitor once a session has
+        gone quiet — never from the relay command path.  Closing right after a
+        relay write was tried in 1.0.48 and reverted: the device began
+        terminating sessions with reason 0x0E and relay COMMANDs stopped being
+        confirmed, so lights reverted a few seconds after each change.
         """
         async with self._rc_session_lock:
             await self._async_close_rc_session_locked(device_id, reason)
@@ -4460,7 +4508,7 @@ class OneControlCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         target = device_id if device_id is not None else self._rc_session_target
         if target is None:
             return
-        self._rc_session_awaiting_confirmation.discard(target)
+        self._rc_session_awaiting_confirmation.pop(target, None)
 
         client = self._client
         sid_bytes = self._rc_session_sid_bytes

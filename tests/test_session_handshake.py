@@ -28,7 +28,7 @@ def _coordinator(**attrs: object) -> OneControlCoordinator:
         # harness short-circuits with an already-running fake task.
         _rc_session_dirty={},
         _rc_session_confirmed=set(),
-        _rc_session_awaiting_confirmation=set(),
+        _rc_session_awaiting_confirmation={},
         _rc_janitor_task=SimpleNamespace(done=lambda: False),
     )
     defaults.update(attrs)
